@@ -1,0 +1,24 @@
+# Go
+# 编译产物:`go build` / `go run` 会在当前目录留下二进制。
+# 项目里 cmd/*/main.go 编译出来就叫 unary / multiplex / stream,一律忽略。
+/unary
+/multiplex
+/stream
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# 测试输出 / 覆盖率
+*.out
+coverage.*
+profile.out
+
+# 编辑器 / OS 杂项
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
