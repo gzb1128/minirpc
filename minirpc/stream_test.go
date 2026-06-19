@@ -3,6 +3,7 @@ package minirpc
 import (
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -164,7 +165,7 @@ func TestRecvTypeErrorFrameReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("Recv on TypeError: got nil, want error")
 	}
-	if msg := err.Error(); !contains(msg, "boom: bad thing") {
+	if msg := err.Error(); !strings.Contains(msg, "boom: bad thing") {
 		t.Errorf("error message %q does not contain server's err text", msg)
 	}
 }
@@ -179,7 +180,7 @@ func TestRecvTypeErrorMalformedPayload(t *testing.T) {
 	if err == nil {
 		t.Fatal("Recv on malformed TypeError: got nil, want error")
 	}
-	if msg := err.Error(); !contains(msg, "not-json-at-all") {
+	if msg := err.Error(); !strings.Contains(msg, "not-json-at-all") {
 		t.Errorf("error message %q should preserve raw payload for debugging", msg)
 	}
 }
@@ -207,12 +208,80 @@ func TestCloseIdempotent(t *testing.T) {
 	}
 }
 
-// contains 是个简单子串判断,避免引入 strings 包。
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
+// TestRecvDrainsAfterPublicCloseWithLiveReadLoop 是 drain 不变量的"真实路径"测试。
+//
+// 为什么这条比 TestRecvDrainsPendingFramesBeforeEOF 更重要?那条测试直接调
+// 内部 recv.close() 跳过了 Stream.Close() 的完整流程 —— 而 Stream.Close() 还会
+// 调 conn.Unregister:从 map 摘掉流 → 关 done。这中间有一个"读循环可能正把
+// 最后一帧投进 channel"的窗口,正是 Demo 3 fixed 模式依赖的不变量。
+//
+// 这条测试用真实 net.Pipe + readLoop:喂 3 帧 DATA 进 pipe → 调公共 Stream.Close()
+// → Recv 必须依次拿到 3 帧,再 EOF。覆盖了之前裸露的公共路径。
+func TestRecvDrainsAfterPublicCloseWithLiveReadLoop(t *testing.T) {
+	a, b := net.Pipe()
+	conn := NewConn(a) // server 端,自带 readLoop
+	defer func() {
+		// 关 b 让 a 的 readLoop 退出,再等它退出完。
+		_ = b.Close()
+		<-conn.Done()
+	}()
+
+	recv, err := conn.Register(11)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	stream := newStream(11, conn, recv)
+
+	// 从 b 端写 3 帧 DATA(StreamID=11)进 pipe。readLoop 会把它们投进 recv.ch。
+	frames := []*Frame{
+		{StreamID: 11, Type: TypeData, Payload: []byte("p1")},
+		{StreamID: 11, Type: TypeData, Payload: []byte("p2")},
+		{StreamID: 11, Type: TypeData, Payload: []byte("p3")},
+	}
+	written := make(chan struct{})
+	go func() {
+		for _, f := range frames {
+			if err := WriteFrame(b, f); err != nil {
+				return
+			}
+		}
+		close(written)
+	}()
+	// 等写完 —— net.Pipe 是同步的,写完 = 对端 ReadFrame 已经读到了。
+	// 再给 readLoop 一点时间把 3 帧从 pipe 投进 recv.ch(它们的容量足够装下)。
+	<-written
+	// busy-wait 直到 recv.ch 里有 3 帧(确定 readLoop 已经投完,而不是还在 pipe 里)。
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(recv.ch) == 3 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if len(recv.ch) != 3 {
+		t.Fatalf("readLoop did not deliver 3 frames into recv.ch (got %d)", len(recv.ch))
+	}
+
+	// 此刻 3 帧都在 recv.ch 里。调**公共** Stream.Close() → Unregister 关 done。
+	// drain 不变量保证:已经在 channel 里的帧必须先被 Recv 消费完,再返回 EOF。
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Stream.Close: %v", err)
+	}
+
+	// Recv 必须依次拿到 p1, p2, p3,再 io.EOF。
+	// (顺序保留,因为 channel 是 FIFO 且这些帧早在 Close 前就排好了。)
+	for i, want := range []string{"p1", "p2", "p3"} {
+		got, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("frame %d after Close: Recv returned %v, want %q (drain invariant broken — frames already in channel got dropped)", i, err, want)
+		}
+		if string(got.Payload) != want {
+			t.Errorf("frame %d: got %q, want %q", i, got.Payload, want)
 		}
 	}
-	return false
+	// 全 drain 完,Recv 必须返回 io.EOF。
+	_, err = stream.Recv()
+	if err != io.EOF {
+		t.Fatalf("after draining all frames, Recv: got %v, want io.EOF", err)
+	}
 }

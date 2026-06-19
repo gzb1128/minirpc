@@ -19,28 +19,12 @@ import (
 //   - Call 多参数(数组打包)
 //   - Client.Close 之后资源释放
 
-// startEchoServer 起 server。handler 由 register 注入。
-func startEchoServer(t *testing.T, register func(*Server)) (addr string) {
-	t.Helper()
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	srv := NewServer()
-	register(srv)
-	go func() { _ = srv.Serve(lis) }()
-	t.Cleanup(func() {
-		_ = lis.Close()
-		_ = srv.Close()
-	})
-	time.Sleep(50 * time.Millisecond)
-	return lis.Addr().String()
-}
+// (startServer 定义在 server_test.go,同一包内,client 测试也用它 —— 不再重复定义。)
 
 // TestClientCallMultiArg 守护:多参数被打包成 JSON 数组,handler 能逐个解出,
 // 返回值也能被 client 正确解码。这是 client.Call 最核心的契约。
 func TestClientCallMultiArg(t *testing.T) {
-	addr := startEchoServer(t, func(s *Server) {
+	addr := startServer(t, func(s *Server) {
 		s.Register("Math.Add", func(stream *Stream, args json.RawMessage) (any, error) {
 			var n []int
 			if err := json.Unmarshal(args, &n); err != nil {
@@ -70,7 +54,7 @@ func TestClientCallMultiArg(t *testing.T) {
 
 // TestClientCallZeroArg 守护:无参数时 args 是 "[]",handler 也能处理。
 func TestClientCallZeroArg(t *testing.T) {
-	addr := startEchoServer(t, func(s *Server) {
+	addr := startServer(t, func(s *Server) {
 		s.Register("Misc.Ping", func(stream *Stream, args json.RawMessage) (any, error) {
 			return "pong", nil
 		})
@@ -94,7 +78,7 @@ func TestClientCallZeroArg(t *testing.T) {
 // TestClientCallReturnsServerError 守护:server handler 返回 error →
 // client.Call 拿到带 server 错误文本的 error。
 func TestClientCallReturnsServerError(t *testing.T) {
-	addr := startEchoServer(t, func(s *Server) {
+	addr := startServer(t, func(s *Server) {
 		s.Register("Fail.Op", func(stream *Stream, args json.RawMessage) (any, error) {
 			return nil, errors.New("boom-from-server")
 		})
@@ -162,10 +146,14 @@ func TestClientCallConnectionClosed(t *testing.T) {
 	// 主动关 client 连接 —— 这模拟"连接断"
 	_ = c.Close()
 
-	// Call 必须返回(error),而不是永久阻塞
+	// Call 必须返回一个 error(而不是永久阻塞,也不是返回 nil 假装成功)。
+	// 注意:这里特意检查"返回的是 error",不光是"返回了" —— 否则一个把连接关闭
+	// 误当成"空响应成功"的回归会悄悄通过这个测试。
 	select {
-	case <-callErr:
-		// 好,返回了。关键是不挂死。
+	case err := <-callErr:
+		if err == nil {
+			t.Fatal("Call returned nil after connection closed — should return an error")
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Call blocked forever after connection closed — should return error")
 	}
@@ -180,10 +168,11 @@ func TestClientCallConnectionClosed(t *testing.T) {
 // allocateID 是私有方法,但测试在包内,可以直接调。
 func TestClientAllocateIDIsOdd(t *testing.T) {
 	// 不需要真 server —— allocateID 不碰网络。但 Client 需要构造。
-	// 用 net.Pipe 起一对连接,a 端包成 Client(它的 readLoop 会跑但不影响测试),
-	// b 端留着不动,c.Close() 时关 a → readLoop 退出,b 端在测试结束后由 GC 处理。
+	// 用 net.Pipe 起一对连接:a 端包成 Client(它的 readLoop 会跑但不影响测试),
+	// b 端也 defer Close 掉,避免泄漏 pipe 的另一头(GC 不保证立刻收)。
 	a, b := net.Pipe()
-	_ = b // 不用,留着防止 b 端立刻 EOF(虽然这里无所谓)
+	defer a.Close()
+	defer b.Close()
 	c := NewClient(a)
 	defer c.Close()
 
@@ -203,7 +192,7 @@ func TestClientAllocateIDIsOdd(t *testing.T) {
 // TestClientCloseReleasesConnection 守护:Client.Close 后底层 net.Conn 真的关了,
 // 之后 Call 会失败(而不是用半开连接)。
 func TestClientCloseReleasesConnection(t *testing.T) {
-	addr := startEchoServer(t, func(s *Server) {
+	addr := startServer(t, func(s *Server) {
 		s.Register("Noop", func(stream *Stream, args json.RawMessage) (any, error) {
 			return nil, nil
 		})
@@ -235,7 +224,7 @@ func TestClientCloseReleasesConnection(t *testing.T) {
 // TestClientConcurrentCallsDontCross 守护:并发 Call 各自拿到对应的结果,
 // 不会因为 StreamID 复用 / 结果串台。这是 client 侧的多路复用正确性。
 func TestClientConcurrentCallsDontCross(t *testing.T) {
-	addr := startEchoServer(t, func(s *Server) {
+	addr := startServer(t, func(s *Server) {
 		s.Register("Echo.OneArg", func(stream *Stream, args json.RawMessage) (any, error) {
 			var a []int
 			if err := json.Unmarshal(args, &a); err != nil {

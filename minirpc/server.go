@@ -3,6 +3,7 @@ package minirpc
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 )
@@ -102,22 +103,28 @@ func (s *Server) Serve(l net.Listener) error {
 // handleConn 处理一条 TCP 连接的全过程。
 //
 // 一条连接 = 一个 Conn(它内部自带一个读循环 goroutine)。
-// "新流的分派"是怎么发生的?关键机制(对应 conn.go):
+// "新流的分派"是怎么发生的?关键机制(对应 conn.go 的 readLoop / handleNewStream):
 //  1. Conn 的读循环从 TCP 读到一帧,看帧的 StreamID。
 //  2. 如果这个 StreamID 还没注册过(=新流的第一帧),且设了 OnNewStream 回调,
-//     读循环就在一个新 goroutine 里调这个回调,把新流的 Stream 作为参数传进去。
-//  3. 我们把回调设成 s.serveStream,于是每个新流 = 一个 serveStream goroutine,
-//     在里面跑 handler。同一个连接上的多条流天然并发,这就是 Demo 2 的基础。
+//     读循环就在**自己这个 goroutine 里同步**调这个回调(conn.go 的 handleNewStream
+//     里是 h(stream),不是 go h(stream)),把新流的 Stream 作为参数传进去。
+//  3. 我们的回调不是 serveStream 本身,而是一个 wrapper 闭包(见下方):
+//     它做 handlerWG.Add(1),然后自己 go serveStream(stream)。
+//     把"起 goroutine"放在 wrapper 里、紧挨着 Add,是为了保证 Add 一定发生在
+//     goroutine 启动之前 —— 这样 Server.Close 的 handlerWG.Wait 不会漏掉任何 handler。
+//     如果像旧设计那样由 conn.go 起 goroutine、Add 在 server 这边,就会有一个
+//     "goroutine 已启动但还没 Add"的窗口,Close 可能错过它。
 //
-// 所以"分派"不是 server.go 里的一个循环,而是 conn.go 读循环 + 回调的组合。
-// 这种"被动开流"对 server 是自然的:server 事先不知道哪个 StreamID 会来。
+// 所以最终每个新流 = 一个 serveStream goroutine(由 wrapper 启动),
+// 同一条连接上的多条流天然并发,这就是 Demo 2 的基础。
+// "分派"不是 server.go 里的一个循环,而是 conn.go 读循环 + 同步回调 + wrapper 起 goroutine
+// 三者的组合。这种"被动开流"对 server 是自然的:server 事先不知道哪个 StreamID 会来。
 func (s *Server) handleConn(nc net.Conn) {
 	// 用一个 Conn 包裹底层 net.Conn —— 它会自动起读循环。
 	conn := NewConn(nc)
-	// 注册"被动开流"回调:读到未知 StreamID 的第一帧 → 起 serveStream。
-	// 包一层 wrapper:在 conn.go 起 goroutine 之前先 handlerWG.Add,保证
-	// Server.Close 的 Wait 一定能覆盖到这条 handler(避免"goroutine 还没 Add
-	// 就被 Wait 漏掉"的窗口)。见 serveStream 里的 Done。
+	// 注册"被动开流"回调:conn.go 读循环读到未知 StreamID 的第一帧时会**同步**调它。
+	// wrapper 在**这里**起 goroutine(不是 conn.go),并紧贴着 handlerWG.Add ——
+	// 保证 Add 严格先于 go,Server.Close 的 Wait 就不会漏掉这条 handler。
 	conn.OnNewStream(func(stream *Stream) {
 		s.handlerWG.Add(1)
 		go func() {
@@ -149,7 +156,7 @@ func (s *Server) serveStream(stream *Stream) {
 	}
 	if reqFrame.Type != TypeRequest {
 		// 协议异常:第一条帧不是 REQUEST。回个错误并关流。
-		_ = stream.Send(TypeError, mustEncode(Response{Err: "expected REQUEST as first frame"}))
+		sendServerFrame(stream, TypeError, mustEncode(Response{Err: "expected REQUEST as first frame"}))
 		stream.Close()
 		return
 	}
@@ -157,7 +164,7 @@ func (s *Server) serveStream(stream *Stream) {
 	// 解析出方法名,从注册表找 handler。
 	var req Request
 	if err := Decode(reqFrame.Payload, &req); err != nil {
-		_ = stream.Send(TypeResponse, mustEncode(Response{Err: "bad request payload: " + err.Error()}))
+		sendServerFrame(stream, TypeResponse, mustEncode(Response{Err: "bad request payload: " + err.Error()}))
 		stream.Close()
 		return
 	}
@@ -166,7 +173,7 @@ func (s *Server) serveStream(stream *Stream) {
 	h, ok := s.handlers[req.Method]
 	s.mu.RUnlock()
 	if !ok {
-		_ = stream.Send(TypeResponse, mustEncode(Response{Err: fmt.Sprintf("unknown method: %s", req.Method)}))
+		sendServerFrame(stream, TypeResponse, mustEncode(Response{Err: fmt.Sprintf("unknown method: %s", req.Method)}))
 		stream.Close()
 		return
 	}
@@ -189,23 +196,35 @@ func (s *Server) serveStream(stream *Stream) {
 			resp.Result = b
 		}
 	}
-	_ = stream.Send(TypeResponse, mustEncode(resp))
+	sendServerFrame(stream, TypeResponse, mustEncode(resp))
 
 	// 框架统一发 TypeClose 作为流的终结信号(client 收到 → Recv 返回 io.EOF)。
 	// unary handler 不自己发 CLOSE,由框架发;流式 handler 一般也是框架发
 	// (本项目 demo 里的流式 handler 都没自己发 CLOSE,所以框架统一兜底)。
 	// 如果未来 handler 自己发了 CLOSE,client 多收一个 EOF 也无害 —— Recv 看到 EOF 就退出。
-	_ = stream.Send(TypeClose, nil)
+	sendServerFrame(stream, TypeClose, nil)
 	stream.Close()
 }
 
-// Close 优雅关闭:停止接受新连接 → 主动关掉所有活跃连接(让它们读循环退出)
+// Close 关闭 server:停止接受新连接 → 主动关掉所有活跃连接(让它们读循环退出)
 // → 等所有连接级 goroutine 和所有请求级(handler)goroutine 跑完。
+//
+// ⚠️ 重要限制(读代码的人务必知道):
+// 关连接会让每条流的 readLoop 退出 → closeAll 关掉所有 recv.ch →
+// handler 的 stream.Recv() 拿到 io.EOF 而退出。所以"handler 在 stream.Recv 上阻塞"
+// 这一类能被正常唤醒,Close 会干净返回。
+//
+// 但如果 handler 阻塞在**别的东西**上(它自己的 channel / select / 外部资源,且没有
+// 把 stream 关闭信号接到那个阻塞上),那它永远不会 return,handlerWG 永远不归零,
+// Close 会**永远阻塞**,且**没有超时 / context 可强制退出**。本项目是教学项目,
+// 故意不引入 context 的复杂度;真实 RPC 框架(ttrpc 等)会把 context 一路传进 handler
+// 来解决这个问题。如果你写的 handler 会自己阻塞,记得在 handler 里 select 一个
+// "stream 关闭"信号(可以用 stream.Conn().Done())。
 //
 // 为什么现在能等到 handler?serveStream 用独立的 s.handlerWG 跟踪自己,
 // handler 跑完才会 Done()。旧实现只 wait 连接 goroutine,慢 handler 会被遗漏。
 //
-// 幂等:多次调用安全。
+// 幂等:多次调用安全(closeOnce 保证)。
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		// 读 listener 要加锁(和 Serve 的写配对)。拿到引用后立刻 Close,
@@ -235,8 +254,12 @@ func (s *Server) Close() error {
 // 为什么这里用 panic 而不是 return error?因为这些调用点的 payload 都是
 // Response{Err: "..."} 这种字面量结构,JSON marshal 不可能失败 —— 如果失败,
 // 那是程序构造错误(不该发生),用 panic 暴露比悄悄吞掉好。
-// 注意:serveStream 跑在独立 goroutine 里,理论上 panic 会让这个 goroutine 挂掉、
-// client 收不到 RESPONSE 而挂起。但只要 payload 是 Response 字面量,这条路径不可达。
+//
+// ⚠️ 爆炸半径说明(给读代码的人):serveStream 跑在独立 goroutine 里、没有 recover,
+// 所以这里一旦真 panic,**整个 server 进程会崩溃**(Go 规定:goroutine 里未恢复的
+// panic 会终止整个程序),而不是只挂起当前 client。所以"payload 必须是 marshal
+// 不可能失败的 Response 字面量"这条不变量**必须严格遵守** —— 任何把用户数据
+// (尤其是 json.RawMessage / chan / func)塞进 mustEncode 的改动都会让 server 可崩。
 // 用户自定义的 result 用的是带 error 处理的 Encode(见上方),不走 mustEncode。
 func mustEncode(v any) []byte {
 	b, err := Encode(v)
@@ -244,4 +267,21 @@ func mustEncode(v any) []byte {
 		panic(fmt.Sprintf("minirpc: cannot encode %v: %v", v, err))
 	}
 	return b
+}
+
+// sendServerFrame 往 client 写一帧,并把写失败记到日志(而不是吞掉)。
+//
+// 为什么不直接 `if err := stream.Send(...); err != nil { ... }` 散在各处?
+// 因为 serveStream 有 5 个写点,统一成一处既保持调用点简洁,又确保"写失败必被看见"
+// 这个约定不会被某个分支偷偷破坏。
+//
+// 写失败意味着什么?通常是 client 已经断开(半开 / RST),RESPONSE 到不了对端。
+// 我们不再能"修好"它 —— 只能记录下来,让运维知道"这次调用的响应丢了",而不是
+// 像旧的 `_ = stream.Send(...)` 那样什么也不说,留下"client 永久挂起 + 服务端无日志"
+// 这种最难诊断的症状。
+func sendServerFrame(stream *Stream, t FrameType, payload []byte) {
+	if err := stream.Send(t, payload); err != nil {
+		log.Printf("minirpc: server stream#%d write %s failed (client likely gone): %v",
+			stream.ID(), t, err)
+	}
 }

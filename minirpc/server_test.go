@@ -18,15 +18,15 @@ import (
 //   - 坏 payload → 错误 RESPONSE
 //   - Server.Close 的优雅关闭语义(等 handler 跑完)
 
-// startServer 在本地随机端口起一个 server,注册一个 "Echo.ToUpper" 方法,
-// 返回 addr 和 cleanup。
-func startServer(t *testing.T, register func(*Server)) (addr string, srv *Server) {
+// startServer 在本地随机端口起一个 server,通过 register 注入 handler,
+// 返回 addr。server 和 listener 都注册了 t.Cleanup 自动关闭,调用方不用管。
+func startServer(t *testing.T, register func(*Server)) (addr string) {
 	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv = NewServer()
+	srv := NewServer()
 	register(srv)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(func() {
@@ -35,13 +35,13 @@ func startServer(t *testing.T, register func(*Server)) (addr string, srv *Server
 	})
 	// 给 Serve goroutine 一点时间真的开始 accept
 	time.Sleep(50 * time.Millisecond)
-	return lis.Addr().String(), srv
+	return lis.Addr().String()
 }
 
 // TestServerUnaryCallHappyPath 是最基础的端到端:client.Call 一个真 handler,
 // 拿回 result。守护 serveStream 的正常路径 + RESPONSE 序列化。
 func TestServerUnaryCallHappyPath(t *testing.T) {
-	addr, _ := startServer(t, func(s *Server) {
+	addr := startServer(t, func(s *Server) {
 		s.Register("Echo.ToUpper", func(stream *Stream, args json.RawMessage) (any, error) {
 			var s []string
 			if err := json.Unmarshal(args, &s); err != nil {
@@ -71,7 +71,7 @@ func TestServerUnaryCallHappyPath(t *testing.T) {
 
 // TestServerHandlerReturnsError 守护:handler return err → RESPONSE.Err → client 收到 error。
 func TestServerHandlerReturnsError(t *testing.T) {
-	addr, _ := startServer(t, func(s *Server) {
+	addr := startServer(t, func(s *Server) {
 		s.Register("Bad.Op", func(stream *Stream, args json.RawMessage) (any, error) {
 			return nil, errors.New("intentional failure")
 		})
@@ -95,7 +95,7 @@ func TestServerHandlerReturnsError(t *testing.T) {
 
 // TestServerUnknownMethod 守护:调用没注册的 method → 错误 RESPONSE。
 func TestServerUnknownMethod(t *testing.T) {
-	addr, _ := startServer(t, func(s *Server) {
+	addr := startServer(t, func(s *Server) {
 		// 注册一个无关的方法
 		s.Register("Something.Else", func(stream *Stream, args json.RawMessage) (any, error) {
 			return nil, nil
@@ -198,7 +198,7 @@ func TestServerCloseIdempotent(t *testing.T) {
 // TestServerConcurrentCalls 守护:同一连接上并发多个调用,各自拿到正确结果
 // (不会串 StreamID / 串结果)。这是 Demo 2 在测试层面的等价物。
 func TestServerConcurrentCalls(t *testing.T) {
-	addr, _ := startServer(t, func(s *Server) {
+	addr := startServer(t, func(s *Server) {
 		s.Register("Math.Double", func(stream *Stream, args json.RawMessage) (any, error) {
 			var nums []int
 			if err := json.Unmarshal(args, &nums); err != nil {
@@ -243,6 +243,84 @@ func TestServerConcurrentCalls(t *testing.T) {
 		}
 		if r.out != r.in*2 {
 			t.Errorf("call in=%d: got out=%d, want %d (results may be crossed — multiplexing bug)", r.in, r.out, r.in*2)
+		}
+	}
+}
+
+// TestServerResponseClosePairing 守护 serveStream 的协议契约:一次 unary 调用
+// 必须产生**恰好一个 RESPONSE + 恰好一个 CLOSE**(对应 frame.go 里 TypeResponse 的注释
+// "一次调用有且仅有一个 Response")。
+//
+// 为什么要数帧?因为 client.Call 只看第一个 RESPONSE 就返回,多发的 RESPONSE 会被
+// 静默丢弃 —— 没有这个测试的话,一个"错误路径发了两次 RESPONSE"或"漏发 CLOSE"
+// 的回归会无声通过(Call 仍然成功),但流式消费者会因此挂死。这个测试数帧,
+// 不让任何一种回归漏掉。
+//
+// 做法:不开 server,直接用一对 net.Pipe 把"client 写 REQUEST"和"server 端跑 serveStream"
+// 接起来,然后在 client 端数收到的所有帧的 Type。
+func TestServerResponseClosePairing(t *testing.T) {
+	// a 端 = server conn(serveStream 往它写 RESPONSE/CLOSE);b 端 = client 读这些帧。
+	a, b := net.Pipe()
+
+	conn := NewConn(a) // server 端,自带 readLoop
+
+	srv := NewServer()
+	srv.Register("P.Count", func(stream *Stream, args json.RawMessage) (any, error) {
+		return 42, nil
+	})
+	conn.OnNewStream(func(stream *Stream) {
+		srv.handlerWG.Add(1)
+		go func() {
+			defer srv.handlerWG.Done()
+			srv.serveStream(stream)
+		}()
+	})
+
+	// client 端:OpenStream + 发 REQUEST。
+	clientConn := NewConn(b) // client 端,自带 readLoop
+	stream, err := clientConn.OpenStream(1)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	req := Request{Method: "P.Count", Args: json.RawMessage("[]")}
+	payload, _ := Encode(req)
+	if err := stream.Send(TypeRequest, payload); err != nil {
+		t.Fatalf("send REQUEST: %v", err)
+	}
+
+	// 数收到的帧的 Type,直到 io.EOF。期望顺序:RESPONSE, CLOSE(→EOF)。
+	var seen []FrameType
+	for {
+		f, err := stream.Recv()
+		if err != nil {
+			break // io.EOF / 任何错误都结束数帧
+		}
+		seen = append(seen, f.Type)
+	}
+
+	// 清理:关 pipe 两端 → 两个 readLoop 退出。srv.Close 等 handlerWG
+	// (保证 serveStream 不会往已关的 a 写,触发 race)。
+	_ = a.Close()
+	_ = b.Close()
+	<-conn.Done()
+	<-clientConn.Done()
+	_ = srv.Close()
+
+	// 断言:恰好一个 RESPONSE,然后 CLOSE 转成 EOF。
+	// (注意循环变量不能用 t,会和 *testing.T 参数重名 —— 用 ft。)
+	gotResponse := 0
+	for _, ft := range seen {
+		if ft == TypeResponse {
+			gotResponse++
+		}
+	}
+	if gotResponse != 1 {
+		t.Errorf("expected exactly 1 RESPONSE frame, got %d (full sequence: %v)", gotResponse, seen)
+	}
+	// 不应该看到第二类不该出现的帧(比如重复 RESPONSE,或 DATA)。
+	for i, ft := range seen {
+		if ft != TypeResponse && ft != TypeClose {
+			t.Errorf("frame %d: unexpected type %v in unary call", i, ft)
 		}
 	}
 }

@@ -105,6 +105,68 @@ func TestReadFrameEOF(t *testing.T) {
 	}
 }
 
+// TestReadFrameRejectsTooSmall 验证 length 校验:一个 length < 5 的畸形帧
+// 必须被 ReadFrame 拒绝(返回 error),而不是 panic。
+//
+// 这守护的是 frame.go 里那个"length 已校验 >= 5"的注释承诺 —— 如果有人
+// 删掉了那个 if length < 5 的检查,下面的用例会立刻失败(或 panic)。
+func TestReadFrameRejectsTooSmall(t *testing.T) {
+	cases := []uint32{0, 1, 2, 3, 4}
+	for _, length := range cases {
+		// 构造 4 字节 Length 前缀(BE),后面随便跟点字节(够不够无所谓,
+		// 因为校验在 ReadFrame 读 payload 之前发生)。
+		buf := bytes.NewBuffer(nil)
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], length)
+		buf.Write(lenBuf[:])
+		buf.Write(make([]byte, length)) // length 字节,匹配声明(避免卡在 ReadFull)
+
+		f, err := ReadFrame(buf)
+		if err == nil {
+			t.Errorf("length=%d: ReadFrame should have errored, got frame %+v", length, f)
+		}
+	}
+}
+
+// TestReadFrameRejectsTooLarge 验证 length 上限:超过 maxFrameSize 的 length
+// 必须被拒绝(避免 4 字节触发数 GB 分配的 DoS)。
+func TestReadFrameRejectsTooLarge(t *testing.T) {
+	buf := bytes.NewBuffer(nil)
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], maxFrameSize+1)
+	buf.Write(lenBuf[:])
+	// 不必真写那么多 payload —— 校验在 make([]byte, length) 之前发生,
+	// 所以 ReadFrame 会在分配前就 return error。
+
+	_, err := ReadFrame(buf)
+	if err == nil {
+		t.Error("ReadFrame should reject length > maxFrameSize")
+	}
+}
+
+// TestReadFrameAcceptsBoundary 验证边界 length == 5(刚好:StreamID 4 + Type 1,
+// payload 为空)被正常接受,且 Payload 是空切片(不 panic)。
+func TestReadFrameAcceptsBoundary(t *testing.T) {
+	// 手工拼一帧:length=5, StreamID=7, Type=TypeData, 无 payload。
+	buf := bytes.NewBuffer(nil)
+	var b [9]byte // 4(length) + 4(streamid) + 1(type)
+	binary.BigEndian.PutUint32(b[0:4], 5)
+	binary.BigEndian.PutUint32(b[4:8], 7)
+	b[8] = byte(TypeData)
+	buf.Write(b[:])
+
+	f, err := ReadFrame(buf)
+	if err != nil {
+		t.Fatalf("length=5: ReadFrame errored: %v (should be accepted)", err)
+	}
+	if f.StreamID != 7 || f.Type != TypeData {
+		t.Errorf("got {%d, %v}, want {7, DATA}", f.StreamID, f.Type)
+	}
+	if len(f.Payload) != 0 {
+		t.Errorf("Payload should be empty, got %d bytes", len(f.Payload))
+	}
+}
+
 // TestPartialRead 验证 ReadFrame 能正确处理"字节分批到达"的情况。
 // TCP 是字节流,一次 Read 可能只返回半个帧 —— ReadFrame 必须用 io.ReadFull 兜住。
 func TestPartialRead(t *testing.T) {
