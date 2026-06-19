@@ -70,20 +70,20 @@ func (t FrameType) String() string {
 //
 // 线上格式(教学用,简单为上):
 //
-//	┌──────────────┬───────────┬──────────┬───────────────┐
-//	│  Length      │ StreamID  │ Type     │ Payload       │
-//	│  (4 bytes,   │ (4 bytes, │ (1 byte) │ (Length-5     │
-//	│   big-endian)│  BE)      │          │  bytes)       │
-//	└──────────────┴───────────┴──────────┴───────────────┘
+//		┌──────────────┬───────────┬──────────┬───────────────┐
+//		│  Length      │ StreamID  │ Type     │ Payload       │
+//		│  (4 bytes,   │ (4 bytes, │ (1 byte) │ (Length-5     │
+//		│   big-endian)│  BE)      │          │  bytes)       │
+//		└──────────────┴───────────┴──────────┴───────────────┘
 //
-// - Length:整个帧"剩余部分"的字节数(StreamID + Type + Payload),不含 Length 自身。
-//   为什么要有 Length?因为 TCP 是字节流,没有消息边界 ——
-//   对端根本不知道一次"读"该读多少字节才算"一整条消息"。
-//   先写长度再写 payload,就是经典的"长度前缀"切消息法。
-// - StreamID:多路复用的钥匙。同一个请求/响应/流事件共享一个 StreamID,
-//   读循环据此把帧投递到对应的逻辑流。详见 conn.go。
-// - Type:见上面 FrameType 枚举。
-// - Payload:序列化后的字节(JSON)。具体结构见 codec.go。
+//	  - Length:整个帧"剩余部分"的字节数(StreamID + Type + Payload),不含 Length 自身。
+//	    为什么要有 Length?因为 TCP 是字节流,没有消息边界 ——
+//	    对端根本不知道一次"读"该读多少字节才算"一整条消息"。
+//	    先写长度再写 payload,就是经典的"长度前缀"切消息法。
+//	  - StreamID:多路复用的钥匙。同一个请求/响应/流事件共享一个 StreamID,
+//	    读循环据此把帧投递到对应的逻辑流。详见 conn.go。
+//	  - Type:见上面 FrameType 枚举。
+//	  - Payload:序列化后的字节(JSON)。具体结构见 codec.go。
 type Frame struct {
 	StreamID uint32
 	Type     FrameType
@@ -130,6 +130,20 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	}
 	length := binary.BigEndian.Uint32(lenBuf[:])
 
+	// 校验 Length。为什么必须校验?因为 Length 来自对端,完全不可信:
+	//   - length < 5:后面的切片 rest[0:4] / rest[4] / rest[5:] 会越界 panic。
+	//     一个畸形帧(4 个零字节 = length 0)就能把整个读循环崩掉。
+	//   - length 巨大(最大 2^32-1):make([]byte, length) 直接吃掉 ~4GB 内存,
+	//     一个 4 字节的畸形帧就能 DoS 掉 server。
+	// 所以这里给两条硬下限 + 一条软上限。maxFrameSize 是"教学项目可接受的单帧上限",
+	// 生产版会做成可配置 / 跟滑动窗口挂钩。
+	if length < 5 {
+		return nil, fmt.Errorf("minirpc: frame length %d too small (need >= 5)", length)
+	}
+	if length > maxFrameSize {
+		return nil, fmt.Errorf("minirpc: frame length %d exceeds max %d", length, maxFrameSize)
+	}
+
 	// 第二步:一次性读出 Length 长度的剩余部分(StreamID + Type + Payload)。
 	// 一次性读,避免半截帧被分发出去。
 	rest := make([]byte, length)
@@ -140,6 +154,13 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	return &Frame{
 		StreamID: binary.BigEndian.Uint32(rest[0:4]),
 		Type:     FrameType(rest[4]),
-		Payload:  rest[5:], // length 一定 >= 5(StreamID 4 + Type 1),这里无需额外校验
+		Payload:  rest[5:], // length 已校验 >= 5,这里切片安全
 	}, nil
 }
+
+// maxFrameSize 是单帧最大字节数(StreamID + Type + Payload)。
+//
+// 16 MiB 对教学项目绰绰有余(本项目最大 payload 是几十字节的 JSON)。
+// 设这个上限主要是为了挡住恶意 / 错误的"巨大 length"导致的内存放大。
+// 对应 ttrpc/HTTP2 的 max frame size 概念,只是这里更宽松。
+const maxFrameSize = 16 * 1024 * 1024

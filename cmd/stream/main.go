@@ -5,22 +5,24 @@
 //
 // 场景(模仿 containerd 的 Import):
 //   - client 想导入一个镜像(Import)。这个操作有两部分产出:
-//       (a) 一个最终结果(RPC 返回值,代表"导入完成")
-//       (b) 一串进度事件(33% → 66% → done,边导入边推)
+//     (a) 一个最终结果(RPC 返回值,代表"导入完成")
+//     (b) 一串进度事件(33% → 66% → done,边导入边推)
 //   - 两部分产出走**两条独立的逻辑流**(因为多路复用允许这么做):
-//       Stream A:client.Call(Import) 阻塞等 RESPONSE(代表"导入完成")
-//       Stream B:server 持续推 progress,client 有个 goroutine 不断 Recv
+//     Stream A:client.Call(Import) 阻塞等 RESPONSE(代表"导入完成")
+//     Stream B:server 持续推 progress,client 有个 goroutine 不断 Recv
 //
 // 竞态点(关键!):
-//   server 推完最后一条 progress(done)和发"Import 完成"的 RESPONSE 是**紧挨着**的,
-//   两条流共用一条 TCP。于是 client 这边:
-//     • 主流程的 client.Call 一收到 RESPONSE 就解阻塞 ——
-//       但此刻 Stream B 的最后一条 progress 可能还躺在 channel 里没被 goroutine Recv 掉!
-//     • 如果主流程紧接着去读 progressCount → 可能读到不全(漏了 done)。
+//
+//	server 推完最后一条 progress(done)和发"Import 完成"的 RESPONSE 是**紧挨着**的,
+//	两条流共用一条 TCP。于是 client 这边:
+//	  • 主流程的 client.Call 一收到 RESPONSE 就解阻塞 ——
+//	    但此刻 Stream B 的最后一条 progress 可能还躺在 channel 里没被 goroutine Recv 掉!
+//	  • 如果主流程紧接着去读 progressCount → 可能读到不全(漏了 done)。
 //
 // 这就是真实代码的结构。我们用两个模式跑出来:
-//   --buggy:主流程不等 progress goroutine 就读计数 → 偶发漏收
-//   --fixed:主流程 join(goroutine 排空后再读)→ 稳定全收
+//
+//	--buggy:主流程不等 progress goroutine 就读计数 → 偶发漏收
+//	--fixed:主流程 join(goroutine 排空后再读)→ 稳定全收
 //
 // 跑法:
 //
@@ -31,6 +33,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -79,8 +82,20 @@ func main() {
 		if err := json.Unmarshal(args, &params); err != nil {
 			return nil, err
 		}
-		name := params[0].(string)
-		progressStreamID := uint32(params[1].(float64))
+		// 防御性解析:坏请求返回 error,而不是 panic。
+		// (server handler 跑在独立 goroutine 里没有 recover,panic 会让 client 永久挂起。)
+		if len(params) < 2 {
+			return nil, fmt.Errorf("Import wants 2 args, got %d", len(params))
+		}
+		name, ok := params[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("Import arg[0] must be string, got %T", params[0])
+		}
+		progressIDFloat, ok := params[1].(float64)
+		if !ok {
+			return nil, fmt.Errorf("Import arg[1] must be number, got %T", params[1])
+		}
+		progressStreamID := uint32(progressIDFloat)
 
 		conn := stream.Conn() // 通过 conn 往"另一条流"写 progress
 
@@ -93,9 +108,17 @@ func main() {
 			{Event: "done", Value: 100},
 		}
 		for _, p := range steps {
-			payload, _ := json.Marshal(p)
+			payload, err := json.Marshal(p)
+			if err != nil {
+				return nil, fmt.Errorf("marshal progress: %w", err)
+			}
 			// 关键:progress 推到 progressStreamID,不是主流自己的 ID。
-			conn.Send(&minirpc.Frame{StreamID: progressStreamID, Type: minirpc.TypeData, Payload: payload})
+			// 检查 Send 错误:写失败说明 client 那边 progress 流可能已关 / 连接断,
+			// 再发下去没意义,提前结束。否则会被误当成 Demo 3 的竞态,混淆诊断。
+			if err := conn.Send(&minirpc.Frame{StreamID: progressStreamID, Type: minirpc.TypeData, Payload: payload}); err != nil {
+				log.Printf("[server] 推 progress 到 stream#%d 失败,停止:%v", progressStreamID, err)
+				return nil, fmt.Errorf("send progress: %w", err)
+			}
 		}
 		// 紧接着返回主流的"完成"(handler return → 框架发 RESPONSE)。
 		// 注意:此时 progress 流的最后一条 DATA 可能还在网络/on-the-wire,
@@ -163,9 +186,9 @@ func main() {
 // runOnce 跑一轮 Import,返回这一轮收到的 progress 条数。
 //
 // 这里的代码结构是"还原真实代码"的(不是故意 sleep 制造竞态):
-//   • 一个 goroutine 不停 Recv progress
-//   • 主流程 Call Import,阻塞等完成
-//   • 主流程拿到完成信号后读 progressCount
+//   - 一个 goroutine 不停 Recv progress
+//   - 主流程 Call Import,阻塞等完成
+//   - 主流程拿到完成信号后读 progressCount
 //
 // buggy / fixed 模式的唯一差异在主流程"拿完完成信号后做什么"。
 func runOnce(client *minirpc.Client, mode string) int {
@@ -256,6 +279,3 @@ func allocProgressStreamID() uint32 {
 		}
 	}
 }
-
-// 防止 go vet 报"time imported and not used"——下面这行只在文档场景用。
-var _ = time.Second

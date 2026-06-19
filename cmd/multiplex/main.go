@@ -50,8 +50,20 @@ func main() {
 		if err := json.Unmarshal(args, &params); err != nil {
 			return nil, err
 		}
-		id := int(params[0].(float64))
-		durMs := int(params[1].(float64))
+		// 防御性解析:坏请求返回 error,而不是 panic。
+		if len(params) < 2 {
+			return nil, fmt.Errorf("SlowOp wants 2 args, got %d", len(params))
+		}
+		idF, ok := params[0].(float64)
+		if !ok {
+			return nil, fmt.Errorf("SlowOp arg[0] must be number, got %T", params[0])
+		}
+		durF, ok := params[1].(float64)
+		if !ok {
+			return nil, fmt.Errorf("SlowOp arg[1] must be number, got %T", params[1])
+		}
+		id := int(idF)
+		durMs := int(durF)
 
 		log.Printf("%s  server  收到 req#%d (stream#%d),sleep %dms", ts(), id, stream.ID(), durMs)
 		// 模拟一个耗时操作。每个请求在 server 自己的 goroutine 里跑,互不影响。
@@ -80,9 +92,8 @@ func main() {
 	// 三个请求:期望耗时分别是 1s / 2s / 0.5s。
 	// 关键:按"发起顺序"是 req#1, #2, #3,但完成顺序应该是 #3(0.5s) → #1(1s) → #2(2s)。
 	reqs := []struct {
-		id  int
-		ms  int
-		out int
+		id int
+		ms int
 	}{
 		{id: 1, ms: 1000},
 		{id: 2, ms: 2000},
@@ -103,7 +114,7 @@ func main() {
 			}
 			log.Printf("%s  client  收到 req#%d 响应   ← %s",
 				ts(), r.id, completeMarker(r.id, reqs))
-			_ = result
+			_ = result // result 没实际用途,demo 只关心完成时序
 		}()
 		// 不加任何 sleep —— 三个请求"几乎同时"发出,证明它们在一条 TCP 上并发飞。
 	}
@@ -124,35 +135,27 @@ func main() {
 
 // completeMarker 生成"← 不是按顺序!证明多路复用" 这种点睛注释,
 // 让读者一眼看到"哎这个完成顺序违反了发起顺序"。
+//
+// rank 计算:按耗时(ms)升序,看 id 是第几个 —— 直接数有多少个比它快的就行,
+// 不需要排序(元素就 3 个,O(n) 计数最直观)。
 func completeMarker(id int, all []struct {
-	id  int
-	ms  int
-	out int
+	id int
+	ms int
 }) string {
-	// 按 ms 升序排,看当前 id 是第几个完成的
-	byDuration := make([]int, len(all))
-	for i, r := range all {
-		byDuration[i] = r.ms
-	}
-	// 简单冒泡排序 byDuration 配合 id,然后看 id 排第几
-	type pair struct{ ms, id int }
-	ps := make([]pair, len(all))
-	for i, r := range all {
-		ps[i] = pair{r.ms, r.id}
-	}
-	for i := 0; i < len(ps); i++ {
-		for j := i + 1; j < len(ps); j++ {
-			if ps[j].ms < ps[i].ms {
-				ps[i], ps[j] = ps[j], ps[i]
-			}
-		}
-	}
-	rank := 1
-	for _, p := range ps {
-		if p.id == id {
+	// 找到自己的耗时
+	myMs := 0
+	for _, r := range all {
+		if r.id == id {
+			myMs = r.ms
 			break
 		}
-		rank++
+	}
+	// 比自己快的个数 + 1 = 自己的完成排名(耗时升序)
+	rank := 1
+	for _, r := range all {
+		if r.ms < myMs {
+			rank++
+		}
 	}
 	if rank == 1 {
 		return "★ 最先完成!不是发起顺序 —— 多路复用的证据"

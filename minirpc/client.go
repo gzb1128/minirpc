@@ -24,9 +24,13 @@ type Client struct {
 	conn *Conn
 	nc   net.Conn // 保留底层引用,Close 时关掉它
 
-	// nextID 是下一个可用 StreamID。client 用奇数(1,3,5,...),server 用偶数,
-	// 这样双向 RPC 不会撞 ID —— 这是 ttrpc/http2 的惯例。本项目目前只有 client 发起,
-	// 所以 1,2,3,... 也行,但保留奇偶分离的好习惯,日后扩展不踩坑。
+	// nextID 是下一个可用 StreamID。
+	//
+	// client 用奇数(1,3,5,...)步进 2。为什么挑奇数?因为 ttrpc/http2 里有个惯例:
+	// "client 发起"用奇数 ID,"server 发起"用偶数 ID,这样双向 RPC 不会撞 ID。
+	// 注意:本项目目前只有 client 主动发起调用,server 是纯被动的(收到未知 ID 的第一帧
+	// 才新建流),所以 server 这边不做 ID 分配。这个奇偶分离纯粹是为"日后扩展双向 RPC"
+	// 留的好习惯 —— Demo 3 的 progress 流就用偶数 ID,正好不跟 Call 的奇数 ID 冲突。
 	nextID atomic.Uint32
 }
 
@@ -56,7 +60,10 @@ func (c *Client) Close() error { return c.nc.Close() }
 
 // allocateID 拿一个新的、唯一的 StreamID,并按奇偶规则步进 2。
 func (c *Client) allocateID() uint32 {
-	// AddAndReturn 语义:先返回当前值再步进。这里步进 2 保证永远是奇数。
+	// CAS 循环:返回"步进前的当前值"(也就是分配给这次调用的 ID),再把计数器 +2。
+	// 步进 2 保证永远是奇数(从 1 开始)。为什么不用 atomic.Add 一步到位?
+	// 因为 Add 返回的是步进后的值,而我们要的是步进前的值作为本次 ID ——
+	// CAS 循环虽然啰嗦但语义最直观,教学优先。
 	for {
 		cur := c.nextID.Load()
 		next := cur + 2

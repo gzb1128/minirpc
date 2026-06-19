@@ -1,0 +1,218 @@
+package minirpc
+
+import (
+	"io"
+	"net"
+	"testing"
+	"time"
+)
+
+// stream_test.go 守护 stream.go 里最微妙的不变量:
+// Stream.Recv 在 done 被关闭后,必须先把队列里已经投递的帧全部 drain 掉,再返回 io.EOF。
+//
+// 为什么这个不变量是项目级的命脉?它是 Demo 3 "fixed 模式能稳定收到全部 progress"
+// 的全部基础。如果有人简化 Recv(比如把那个 for 循环或非阻塞预读删掉),
+// Demo 3 的 fixed 模式就会偶发漏收 —— 而这正是本项目存在的全部意义(复现 + 修复
+// containerd PR #13625 的竞态)。所以这些测试必须存在,守住这个不变量。
+
+// newBareStream 用内部构造直接造一条 stream(不依赖真实网络),
+// 精确控制"队列里有什么"。返回 (stream, recv),recv.close() 可模拟 Stream.Close
+// 的"关 done"那一步(但不走 Unregister,所以不碰 conn,conn 可以为 nil)。
+//
+// 这种"绕过 conn 直接测 Recv 的 drain 逻辑"的写法,正是 unit test 应该做的:
+// 把被测的最小单元(Stream.Recv)孤立出来,精确喂输入。
+func newBareStream(t *testing.T) (*Stream, *streamRecv) {
+	t.Helper()
+	recv := newStreamRecv()
+	// conn 传 nil:这些测试只调 Recv(不调 Send / Close),不会碰 conn。
+	s := newStream(42, nil, recv)
+	return s, recv
+}
+
+// newLiveStream 起一对 net.Pipe + 一个真 Conn,返回 server 端的 stream。
+// 用于需要调 Close()(它内部要走 conn.Unregister)的测试。
+func newLiveStream(t *testing.T) (*Stream, *Conn, func()) {
+	t.Helper()
+	a, b := net.Pipe()
+	conn := NewConn(a) // server 端 conn,自带 readLoop
+	recv, err := conn.Register(7)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	s := newStream(7, conn, recv)
+	cleanup := func() {
+		b.Close()
+		<-conn.Done()
+	}
+	return s, conn, cleanup
+}
+
+// TestRecvDrainsPendingFramesBeforeEOF 是最关键的一条测试:
+// 队列里先有 3 帧,然后关 done(模拟 Stream.Close 的关 done 那步),
+// Recv 必须依次拿到这 3 帧,最后才返回 io.EOF。
+//
+// 如果有人把 Recv 改成"done 一关就立即返回 EOF"(删掉 drain 逻辑),
+// 这条测试会立刻失败 —— 这正是它要守护的回归。
+func TestRecvDrainsPendingFramesBeforeEOF(t *testing.T) {
+	s, recv := newBareStream(t)
+
+	// 投 3 帧进队列(模拟 server 在 client Close 前刚推完的 progress)
+	frames := []*Frame{
+		{StreamID: 42, Type: TypeData, Payload: []byte("a")},
+		{StreamID: 42, Type: TypeData, Payload: []byte("b")},
+		{StreamID: 42, Type: TypeData, Payload: []byte("c")},
+	}
+	for _, f := range frames {
+		recv.ch <- f
+	}
+	// 现在关 done —— 这模拟 Stream.Close()(内部走 Unregister → recv.close)。
+	recv.close()
+
+	// Recv 必须依次拿到 a, b, c,而不是任何一个被 done 抢跑后丢掉。
+	for i, want := range []string{"a", "b", "c"} {
+		got, err := s.Recv()
+		if err != nil {
+			t.Fatalf("frame %d: Recv returned %v, want frame %q (done closed but queue had pending frames — drain invariant broken)", i, err, want)
+		}
+		if string(got.Payload) != want {
+			t.Errorf("frame %d: got payload %q, want %q", i, got.Payload, want)
+		}
+	}
+	// 3 帧都 drain 完后,Recv 才该返回 EOF。
+	_, err := s.Recv()
+	if err != io.EOF {
+		t.Fatalf("after draining 3 frames: Recv returned %v, want io.EOF", err)
+	}
+}
+
+// TestRecvReturnsEOFOnEmptyQueueClose 守护另一个端点:
+// 队列空 + done 关 → 立即返回 io.EOF(不要死锁或空转)。
+func TestRecvReturnsEOFOnEmptyQueueClose(t *testing.T) {
+	s, recv := newBareStream(t)
+	recv.close() // 队列空就关 done
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Recv()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != io.EOF {
+			t.Fatalf("Recv on closed-empty stream: got %v, want io.EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Recv on closed-empty stream blocked forever — should return io.EOF promptly")
+	}
+}
+
+// TestRecvBlocksWhenQueueEmptyAndDoneOpen 守护"正常等待"语义:
+// 队列空 + done 未关 → Recv 阻塞(不立即返回 nil/EOF)。
+// 用一个 goroutine 投帧来"唤醒"它。
+func TestRecvBlocksWhenQueueEmptyAndDoneOpen(t *testing.T) {
+	s, recv := newBareStream(t)
+
+	got := make(chan *Frame, 1)
+	go func() {
+		f, err := s.Recv()
+		if err != nil {
+			t.Errorf("Recv: %v", err)
+			return
+		}
+		got <- f
+	}()
+
+	// 短暂等待,确认 Recv 真的阻塞了(没立刻返回)
+	select {
+	case f := <-got:
+		t.Fatalf("Recv returned %q before any frame was sent — should have blocked", f.Payload)
+	case <-time.After(50 * time.Millisecond):
+		// 好,确实在阻塞
+	}
+
+	// 投一帧,Recv 应该被唤醒
+	recv.ch <- &Frame{StreamID: 42, Type: TypeData, Payload: []byte("hello")}
+	select {
+	case f := <-got:
+		if string(f.Payload) != "hello" {
+			t.Errorf("got %q, want hello", f.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Recv did not wake up after frame was sent")
+	}
+}
+
+// TestRecvTypeCloseFrameReturnsEOF 守护"收到 TypeClose 帧 → io.EOF"的转换。
+// 这是 server 显式发"流结束"信号的语义。
+func TestRecvTypeCloseFrameReturnsEOF(t *testing.T) {
+	s, recv := newBareStream(t)
+	recv.ch <- &Frame{StreamID: 42, Type: TypeClose, Payload: nil}
+	_, err := s.Recv()
+	if err != io.EOF {
+		t.Fatalf("Recv on TypeClose frame: got %v, want io.EOF", err)
+	}
+}
+
+// TestRecvTypeErrorFrameReturnsError 守护"收到 TypeError 帧 → streamError"。
+// 同时验证 payload 里的 Response.Err 被正确提取。
+func TestRecvTypeErrorFrameReturnsError(t *testing.T) {
+	s, recv := newBareStream(t)
+	errPayload := mustEncode(Response{Err: "boom: bad thing"})
+	recv.ch <- &Frame{StreamID: 42, Type: TypeError, Payload: errPayload}
+	_, err := s.Recv()
+	if err == nil {
+		t.Fatal("Recv on TypeError: got nil, want error")
+	}
+	if msg := err.Error(); !contains(msg, "boom: bad thing") {
+		t.Errorf("error message %q does not contain server's err text", msg)
+	}
+}
+
+// TestRecvTypeErrorMalformedPayload 守护 streamErr 的 fallback:
+// payload 不是合法 JSON / 没有 Err 字段时,不要吞掉,把 raw 附上。
+func TestRecvTypeErrorMalformedPayload(t *testing.T) {
+	s, recv := newBareStream(t)
+	raw := []byte("not-json-at-all")
+	recv.ch <- &Frame{StreamID: 42, Type: TypeError, Payload: raw}
+	_, err := s.Recv()
+	if err == nil {
+		t.Fatal("Recv on malformed TypeError: got nil, want error")
+	}
+	if msg := err.Error(); !contains(msg, "not-json-at-all") {
+		t.Errorf("error message %q should preserve raw payload for debugging", msg)
+	}
+}
+
+// TestRecvTypeErrorEmptyErr 同上但合法 JSON + 空 Err。
+func TestRecvTypeErrorEmptyErr(t *testing.T) {
+	s, recv := newBareStream(t)
+	// Err 为空 → streamErr 走 fallback,带上 raw payload
+	recv.ch <- &Frame{StreamID: 42, Type: TypeError, Payload: []byte(`{"err":""}`)}
+	_, err := s.Recv()
+	if err == nil {
+		t.Fatal("Recv on TypeError with empty err: got nil, want error")
+	}
+}
+
+// TestCloseIdempotent 守护 Close 幂等性(多次调用安全)。
+// 用真实 Conn,因为 Close 内部要走 conn.Unregister。
+func TestCloseIdempotent(t *testing.T) {
+	s, _, cleanup := newLiveStream(t)
+	defer cleanup()
+	for i := 0; i < 3; i++ {
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close #%d: %v", i, err)
+		}
+	}
+}
+
+// contains 是个简单子串判断,避免引入 strings 包。
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}

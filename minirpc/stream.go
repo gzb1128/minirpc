@@ -1,6 +1,7 @@
 package minirpc
 
 import (
+	"fmt"
 	"io"
 	"sync"
 )
@@ -166,13 +167,20 @@ func (s *Stream) Close() error {
 }
 
 // streamErr 把一个 TypeERROR 帧解成 error。
+//
+// payload 约定是一个 JSON 编码的 Response,取它的 Err 字段。
+// 如果 decode 失败 / Err 为空(对端发了一个畸形错误帧),不要用一个无信息的
+// "stream error" 吞掉它 —— 把原始 payload(截断)附上,方便排查。
 func streamErr(f *Frame) error {
-	// payload 是错误文本;解析失败就退化为"未知流错误"
 	var resp Response
 	if Decode(f.Payload, &resp) == nil && resp.Err != "" {
 		return streamError{msg: resp.Err}
 	}
-	return streamError{msg: "stream error"}
+	raw := string(f.Payload)
+	if len(raw) > 128 {
+		raw = raw[:128] + "...(truncated)"
+	}
+	return streamError{msg: fmt.Sprintf("stream error (raw=%q)", raw)}
 }
 
 type streamError struct{ msg string }

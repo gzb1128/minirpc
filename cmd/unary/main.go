@@ -13,7 +13,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -75,7 +74,6 @@ func main() {
 	log.Printf("         5) 阻塞等 RESPONSE(同一个 StreamID=1)")
 
 	var result int
-	_ = context.Background() // 这里用不到 context,但留着示意:真实 RPC 都支持 context
 	if err := client.Call("MathService.Add", &result, 2, 3); err != nil {
 		log.Fatalf("Call: %v", err)
 	}

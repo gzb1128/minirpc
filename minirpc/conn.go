@@ -38,9 +38,9 @@ const perStreamChanCap = 8
 //   - server 侧:server 不知道哪个 StreamID 会来,只能等第一帧到了才知道。
 //
 // 所以 Conn 提供两种模式:
-//   1. 主动模式:调用方先 Register(id),再收发。
-//   2. 被动模式:设置 OnNewStream 回调,读循环遇到未知 StreamID 的帧时,
-//      先回调(由回调内部 Register),再把第一帧投递给新建的流。
+//  1. 主动模式:调用方先 Register(id),再收发。
+//  2. 被动模式:设置 OnNewStream 回调,读循环遇到未知 StreamID 的帧时,
+//     先回调(由回调内部 Register),再把第一帧投递给新建的流。
 //
 // server 用被动模式,client 用主动模式。
 type NewStreamHandler func(stream *Stream)
@@ -112,7 +112,17 @@ func NewConn(rw io.ReadWriter) *Conn {
 
 // OnNewStream 设置"被动模式"回调,供 server 使用。
 // 一条连接只在最开始设置一次;读循环遇到未知 StreamID 的帧时会调用它。
-func (c *Conn) OnNewStream(h NewStreamHandler) { c.onNewStream = h }
+//
+// 注意:这里用 c.mu 保护写,readLoop 里读也用同一把锁 —— 因为 NewConn 已经起
+// 了 readLoop(它会读 onNewStream),所以"设置回调"和"读循环读回调"之间
+// 必须有 happens-before,否则 race detector 会报数据竞争。
+// 典型用法是 NewConn 之后立刻 OnNewStream(在本项目 server.handleConn 里就是这样),
+// 但代码上不能假设这个顺序,所以加锁保证安全。
+func (c *Conn) OnNewStream(h NewStreamHandler) {
+	c.mu.Lock()
+	c.onNewStream = h
+	c.mu.Unlock()
+}
 
 // Register 为 StreamID 开通一条入站队列,返回它(供 newStream 构造 Stream)。
 //
@@ -190,12 +200,13 @@ func (c *Conn) readLoop() {
 
 		c.mu.Lock()
 		recv, ok := c.streams[f.StreamID]
+		h := c.onNewStream // 在锁内读,和 OnNewStream 的写配对,避免数据竞争
 		c.mu.Unlock()
 
 		if !ok {
 			// 没人注册过这个 StreamID 的流。
 			// 如果设了 onNewStream(server 模式),交给回调去创建流;否则直接丢弃。
-			if c.onNewStream != nil {
+			if h != nil {
 				c.handleNewStream(f)
 			}
 			continue
@@ -239,8 +250,11 @@ func (c *Conn) handleNewStream(first *Frame) {
 	c.mu.Unlock()
 
 	stream := newStream(first.StreamID, c, recv)
-	// 起 server handler goroutine,这里就是并发处理的入口。
-	go h(stream)
+	// 调用 onNewStream 回调。注意:**这里不在这里 go**,而是把"起 goroutine"的
+	// 责任交给回调本身 —— 这样调用方(server)可以在起 goroutine 之前做必要的
+	// 计数(比如 handlerWG.Add),避免"goroutine 启动了但还没 Add"的关闭竞态。
+	// 读循环不能被回调阻塞太久,所以回调必须立刻返回(典型实现:回调里 Add + go)。
+	h(stream)
 	// 把第一帧投回去,handler 的第一个 Recv() 就能拿到它。
 	recv.ch <- first
 }

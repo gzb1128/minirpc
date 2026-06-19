@@ -13,8 +13,8 @@ import (
 
 func TestFrameRoundTrip(t *testing.T) {
 	cases := []struct {
-		name    string
-		frame   *Frame
+		name  string
+		frame *Frame
 	}{
 		{"request", &Frame{StreamID: 1, Type: TypeRequest, Payload: []byte(`{"method":"M.A","args":[1,2]}`)}},
 		{"response", &Frame{StreamID: 42, Type: TypeResponse, Payload: []byte(`{"result":5}`)}},
