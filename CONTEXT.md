@@ -151,6 +151,48 @@ type Progress struct {
 - 双方各维护一个 `map[StreamID]chan Frame`,读循环把帧按 StreamID 投递到对应 channel。
 - 一条 TCP 连接 = 一个读循环 goroutine,负责解帧 + 分发。
 
+### 3.4 框架与 function 的职责边界 ⭐(最本质的一点)
+
+读到这里容易产生一个误解:"流式 RPC 是框架的一种特殊模式"。
+**不是。** 框架的收发逻辑在 unary 和 streaming 里**完全一致**,差别只发生在
+function(method handler)内部。把这条边界讲清楚,整个设计就通了:
+
+**框架(minirpc)负责的,只有两件事:**
+
+1. **逻辑流的建立与分派** —— 一条 TCP 上,读循环(`readLoop`)不停地从字节流里
+   切出 frame、按 header 里的 `StreamID` 分发到对应入站队列。这是框架的活,
+   和"这条流上传什么内容"无关。无论 unary 还是 streaming,这部分代码一模一样。
+   - client 侧:主动 `OpenStream(id)` 注册队列,然后 `Send` 第一帧 REQUEST。
+   - server 侧:被动收到未知 StreamID 的第一帧时,建队列 + 起 handler goroutine
+     (`handleNewStream` → `OnNewStream` 回调 → `serveStream`)。
+
+2. **流的生命周期信号** —— 框架认识并处理 `REQUEST`(分派 method)和 `CLOSE`
+   (转成 `io.EOF`,表示一个方向的流结束;`serveStream` 在 handler 返回后也会统一发
+   `RESPONSE` + `CLOSE`)。这些是**协议级**的,框架统一兜底。
+
+**框架不管的:流上"具体传什么"。**
+
+第一帧 REQUEST 的 payload 只有一个 `Method` + `Args`。分派完 method、把 `stream`
+交给 handler 之后,**这条流上后续的 DATA 帧传什么、传几帧、往哪个方向传、payload 怎么
+解释——全靠 client 和 server 在这个 function 上的约定**。框架不解析 DATA 的语义,
+只负责把它按 StreamID 投递到队列里(字节怎么编、业务怎么解,是 function 的事)。
+
+所以:
+- **Demo 1(unary)**:function 约定"一个 REQUEST + 一个 RESPONSE",没有后续 DATA。
+- **Demo 3(server-streaming)**:function 约定"server 持续推 progress DATA"。
+  框架不关心 progress 长什么样,server handler 自己 `Send`,client 自己 `Recv` 解析。
+- 如果想做 client-streaming / bidi:**不用改框架**。client 在同一个已建立的 stream 上
+  持续 `Send`(发完用 `CloseSend` 半关闭),server handler 在 `Recv` 循环里持续消费。
+  只要两边对这个 function 的"收发协议"理解一致,就能正确 produce / consume。
+
+**一句话总结:逻辑流的建立(框架管)和流上要传的内容(function 协商)是解耦的。**
+框架只保证"这条流上的 frame 符合 minirpc 的帧格式,且 REQUEST/CLOSE 被正确处理";
+其余全是 client 和 server 基于 function 接口契约自己的事。
+
+> 为什么 Go 的实现这么干净?因为 channel 天然是"阻塞 FIFO 队列":`readLoop` 往
+> `recv.ch` 投递,handler 从 `stream.Recv()` 取,`select` 自然处理"流结束 vs 拿到帧"
+> 两个分支。别的语言(没有 channel)要手搓队列 + 锁 + 条件变量,同样的模型会复杂很多。
+
 ---
 
 ## 4. 时序图 (必须能跑出来对应)
