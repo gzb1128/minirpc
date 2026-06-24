@@ -81,56 +81,29 @@ func (s *Stream) Send(t FrameType, payload []byte) error {
 //	}
 //
 // ── 实现细节(踩过坑,很重要)─────────────────────────────────────────
-// 关键难点:Close() 会关闭 recv.done,而 Go 的 select 在多个 case 同时
-// ready 时是**随机**选一个。如果"队列里有帧" 和 "done 已关闭"同时为真,
-// select 可能直接走 done 分支返回 io.EOF,把队列里还没读的帧**丢掉**。
+// 这里有两个不同的"结束"语义,不能混在一起:
 //
-// 这对 Demo 3 是致命的:fixed 模式靠的就是"主流程 Close 后等 goroutine
-// 把队列里所有帧 Recv 完再退出",如果 Recv 在 done 已关时跳过队列里的帧,
-// join 也救不了。
-//
-// 所以 Recv 必须保证:**只要队列里还有帧,就一定先消费完,再考虑 EOF**。
-// 下面用一个 for 循环 + "done 仅作为唤醒信号" 来实现这个保证。
+//   - 对端正常结束流:它会发 TypeClose 帧。TypeClose 和前面的 DATA 同在
+//     recv.ch 里排队,所以 Recv 会自然按 FIFO 先读完 DATA,再在 TypeClose
+//     上返回 io.EOF。
+//   - 本地调用 Close():它会关闭 recv.done,表示调用方已经放弃这条流。
+//     此时 Recv 应该尊重本地关闭,尽快返回 io.EOF,不要再 drain 队列。
 //
 // 另一个细节:当整个 Conn 关闭时,closeAll 会 close(recv.ch),此时
 // `f, ok := <-ch` 的 ok 变成 false,handleFrame 会返回 io.EOF。
 // 所以 Conn 级别的关闭也能让 Recv 正常返回,不死锁。
 func (s *Stream) Recv() (*Frame, error) {
-	for {
-		// 优先非阻塞读队列。有帧就直接处理,绝不让 done 抢跑。
-		select {
-		case f, ok := <-s.recv.ch:
-			return s.handleFrame(f, ok)
-		default:
-		}
+	select {
+	case <-s.recv.done:
+		return nil, io.EOF
+	default:
+	}
 
-		// 队列暂时没有帧,阻塞等。
-		// 两个 case:队列来了帧 / done 被关(Close 或连接级 closeAll 触发)。
-		select {
-		case f, ok := <-s.recv.ch:
-			return s.handleFrame(f, ok)
-		case <-s.recv.done:
-			// done 被关了 —— 但此时队列可能"几乎同时"又有帧到达
-			// (因为 Close 和 server 最后一条 DATA 是并发的)。
-			// 所以这里不能直接 return EOF,而是回到 for 循环顶部,
-			// 再做一次非阻塞读。如果队列里还有帧,会被处理掉;
-			// 如果队列真空了,下一次非阻塞读走 default → 再次进阻塞 select →
-			// done 仍关 → 再回顶部 …… 这样会空转吗?
-			// 不会:连接级关闭会 close(ch),那 non-blocking 读会拿到 ok=false。
-			// 而单流 Close(Unregister)只 close(done) 不 close(ch),所以如果
-			// ch 真的空且不会再有帧,我们需要另一个信号。
-			// 解决:Unregister 已经把流从 map 摘掉,读循环不会再投递。
-			// 此时如果 ch 空,Recvr 该返回 EOF —— 我们用下面的 drain 检查:
-			// done 已关 → 流已被 Unregister(或连接关),不可能再投递新帧,
-			// 所以"ch 当前空"就等价于"永远不会再来帧",可以安全返回 EOF。
-			select {
-			case f, ok := <-s.recv.ch:
-				// 最后一刻又有帧(连接级 closeAll 之前投进来的),处理掉
-				return s.handleFrame(f, ok)
-			default:
-				return nil, io.EOF
-			}
-		}
+	select {
+	case <-s.recv.done:
+		return nil, io.EOF
+	case f, ok := <-s.recv.ch:
+		return s.handleFrame(f, ok)
 	}
 }
 
