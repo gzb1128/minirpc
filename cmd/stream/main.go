@@ -40,7 +40,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"minirpc/minirpc"
+	"github.com/gzb1128/minirpc/minirpc"
 )
 
 // Progress 是流里的一条数据(Demo 3 专用的 payload 结构,见 CONTEXT.md 3.2)。

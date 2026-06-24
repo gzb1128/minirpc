@@ -19,7 +19,7 @@
 ## 目录结构
 
 ```
-rpc/
+minirpc/
 ├── CONTEXT.md              # 实现规格(实现前必读)
 ├── README.md               # 本文件
 ├── go.mod                  # 零外部依赖,只用标准库
