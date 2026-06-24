@@ -71,16 +71,17 @@ minirpc/
 - **教学点**:展示"调用远程函数"的完整链路:序列化 → 帧化 → 发送 → server 解析 → 执行 → 回响应 → client 反序列化 → 返回。打印每一步的日志。
 
 #### Demo 2: `cmd/multiplex/` — 多路复用可视化 ⭐ 核心
-- client 在**一条 TCP 连接**上,**并发**发起 3 个慢请求(比如 `SlowOp(id, duration)`),每个 server 端 sleep 不同时长(1s / 2s / 0.5s)
+- client 在**一条 TCP 连接**上,**并发**发起 3 个慢请求(比如 `SlowOp(duration)`),每个 server 端 sleep 不同时长(1s / 2s / 0.5s)
+- Demo 日志可以用 `task A/B/C` 表示发起顺序,但这些只是本地展示标签,不要作为 RPC 入参;真正把 frame map 回逻辑流的是协议层 `StreamID`
 - 三个请求必须**交错完成**(0.5s 的先回来,不是按发起顺序)
 - **必须输出一张时序日志**,形如:
   ```
-  T+0.000s  client  发起 req#1 (期望 1.0s)
-  T+0.000s  client  发起 req#2 (期望 2.0s)
-  T+0.000s  client  发起 req#3 (期望 0.5s)
-  T+0.501s  client  收到 req#3 响应   ← 不是按顺序!证明多路复用
-  T+1.001s  client  收到 req#1 响应
-  T+2.001s  client  收到 req#2 响应
+  T+0.000s  client  发起 task A (RPC 只发送 duration=1000ms)
+  T+0.000s  client  发起 task B (RPC 只发送 duration=2000ms)
+  T+0.000s  client  发起 task C (RPC 只发送 duration=500ms)
+  T+0.501s  client  收到 task C 响应   ← 不是按顺序!证明多路复用
+  T+1.001s  client  收到 task A 响应
+  T+2.001s  client  收到 task B 响应
   ```
 - **教学点**:证明"一条 TCP,多个并发逻辑流,各自独立完成"。这是回答"为什么 RPC 响应能比 progress 流先到"的活证据。
 
@@ -161,17 +162,19 @@ client 进程                              server 进程
 ─────────────                            ─────────────
 一条 net.Conn ───────────────────────────────────────
 
-T=0  发 [id=1]REQUEST(SlowOp,1s)  ───►   读到 id=1,起 goroutine sleep 1s
-T=0  发 [id=2]REQUEST(SlowOp,2s)  ───►   读到 id=2,起 goroutine sleep 2s
-T=0  发 [id=3]REQUEST(SlowOp,.5s) ───►   读到 id=3,起 goroutine sleep .5s
+T=0  task A 发 [stream=X]REQUEST(SlowOp,1000ms) ───►  stream=X sleep 1s
+T=0  task B 发 [stream=Y]REQUEST(SlowOp,2000ms) ───►  stream=Y sleep 2s
+T=0  task C 发 [stream=Z]REQUEST(SlowOp,500ms)  ───►  stream=Z sleep .5s
                                           (3 个 server goroutine 并发)
-T=.5s                              ◄───  发 [id=3]RESPONSE     ← 先回来!
-     id=3 的 channel 收到 → 唤醒等 id=3 的 client goroutine
-T=1s                               ◄───  发 [id=1]RESPONSE
-T=2s                               ◄───  发 [id=2]RESPONSE     ← 最后
+T=.5s                              ◄───  发 [stream=Z]RESPONSE     ← 先回来!
+     stream=Z 的 channel 收到 → 唤醒等 stream=Z 的 client goroutine
+T=1s                               ◄───  发 [stream=X]RESPONSE
+T=2s                               ◄───  发 [stream=Y]RESPONSE     ← 最后
 
 关键观察:三条响应到达顺序 = 完成顺序,不是发起顺序。
          全程只用一条 TCP。这就是多路复用。
+         task A/B/C 是 demo 的本地展示标签,和协议里的 StreamID 没有因果关系。
+         并发调度下 task 与具体 stream 数字的对应关系也可能每次不同。
 ```
 
 ### 4.2 Demo 3 流式 + 竞态时序(对应 containerd bug)
