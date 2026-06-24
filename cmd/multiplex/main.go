@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"minirpc/minirpc"
+	"github.com/gzb1128/minirpc/minirpc"
 )
 
 // timer 用于打印"T+0.123s"这样的相对时间戳,让时序一眼能看出来。

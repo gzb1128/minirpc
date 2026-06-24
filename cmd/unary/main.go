@@ -19,7 +19,7 @@ import (
 	"net"
 	"time"
 
-	"minirpc/minirpc"
+	"github.com/gzb1128/minirpc/minirpc"
 )
 
 func main() {
