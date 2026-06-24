@@ -91,7 +91,7 @@ minirpc/
 - **关键教学点:复现 containerd PR #13625 的竞态**
   - Demo 要提供两个模式:
     - `--buggy`:主流程 RPC 返回后**立即**读 progress 计数 → 间歇性读到不全(因为 goroutine 还没 Recv 完)
-    - `--fixed`:主流程 RPC 返回后**等待 progress goroutine 排空**(join)再读 → 稳定读到全部
+    - `--fixed`:主流程 RPC 返回后**等待 progress goroutine 读到 CLOSE 并退出**(join)再读 → 稳定读到全部
   - 跑 `--buggy` 多次(`-count=20`)能看到偶发少收事件;`--fixed` 稳定全收
 - **教学点**:这是把抽象的"多路复用导致异步"变成可复现、可修复的代码。作者亲历过这个 bug 的排查,这里让它"落地"。
 
@@ -193,8 +193,8 @@ T=.1s                                         ◄───  发 [id=B]DATA(progr
      id=B channel 收到 → goroutine Recv 到 → 回调   │
 T=.2s                                         ◄───  发 [id=B]DATA(progress 66%)
 T=.3s                                         ◄───  发 [id=B]DATA(done)
+T=.3s                                         ◄───  发 [id=B]CLOSE(EOF)
 T=.3s                                         ◄───  发 [id=A]RESPONSE(ok)  ← RPC 完成
-                                                    + 发 [id=B]CLOSE(EOF)
 
      ┌── 主流程 client.Call 收到 id=A 响应,解阻塞!
      │
@@ -204,7 +204,7 @@ T=.3s                                         ◄───  发 [id=A]RESPONSE(o
   (--buggy 模式):
      主流程立刻读 progressCount → 可能是 2(漏了 done) ❌ 偶发
   (--fixed 模式):
-     主流程等 <-done(goroutine 排空后再唤醒)→ progressCount=3 ✓ 稳定
+     主流程等 <-done(goroutine 读到 CLOSE 后再唤醒)→ progressCount=3 ✓ 稳定
 ```
 
 **这张时序图就是 containerd PR #13625 的本质**。Demo 3 要让作者能跑出这两种模式的差异。

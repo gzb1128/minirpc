@@ -53,16 +53,19 @@ type NewStreamHandler func(stream *Stream)
 //	流的用户调用 Close() 想 close(ch) 让阻塞中的 Recv 返回 EOF。
 //	如果读循环在"已 close"的 channel 上 send → panic: send on closed channel。
 //
-// 解决方法:**永远不 close 这个 channel**。改用一个 closed 标志位 + done channel
+// 解决方法:流被本地 Close 时**不 close 这个 channel**。改用 done channel
 // 来表达"流已结束"。读循环在 send 前用 select 同时监听 done,流一关就停止投递。
 // channel 本身只在整个 Conn 关闭时(closeAll)才被 close —— 那时读循环已经停了,
 // 不会再 send,安全。
 type streamRecv struct {
 	ch chan *Frame
 
-	// done 在流 Close 时被关闭。两个用途:
+	// done 只在本地流 Close 时被关闭。两个用途:
 	//   1. 唤醒阻塞在 Recv 上的调用方(返回 EOF)。
 	//   2. 让读循环的 select 在"流已关"时停止往里投递(见投递处注释)。
+	//
+	// 注意:对端正常结束流不走 done,而是发 TypeClose 帧;整个 Conn 关闭也不走
+	// done,而是 close(ch)。这样本地取消和远端 EOF 的语义不会混在一起。
 	done chan struct{}
 
 	closeOnce sync.Once
@@ -156,11 +159,11 @@ func (c *Conn) OpenStream(id uint32) (*Stream, error) {
 	return newStream(id, c, recv), nil
 }
 
-// Unregister 把一条流标记为"入站侧结束"并从 map 摘掉。
+// Unregister 把一条流标记为"本地不再接收"并从 map 摘掉。
 //
 // 注意:它**不 close** recv.ch(避免读循环 send-on-closed panic),只 close recv.done。
-// 之后读循环看到 done 已关,不会再往这个队列投递帧;流的 Recv 看到 done 后
-// drain 完剩余帧就返回 EOF。channel 真正被 close 只发生在 closeAll(整个连接结束)。
+// 之后读循环看到 done 已关,不会再往这个队列投递帧;流的 Recv 看到 done 后立即
+// 返回 EOF。channel 真正被 close 只发生在 closeAll(整个连接结束)。
 func (c *Conn) Unregister(id uint32) {
 	c.mu.Lock()
 	recv, ok := c.streams[id]
@@ -268,7 +271,6 @@ func (c *Conn) closeAll() {
 		c.mu.Lock()
 		c.closed = true
 		for id, recv := range c.streams {
-			recv.close()
 			close(recv.ch)
 			delete(c.streams, id)
 		}

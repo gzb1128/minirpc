@@ -22,7 +22,7 @@
 // 这就是真实代码的结构。我们用两个模式跑出来:
 //
 //	--buggy:主流程不等 progress goroutine 就读计数 → 偶发漏收
-//	--fixed:主流程 join(goroutine 排空后再读)→ 稳定全收
+//	--fixed:主流程 join(goroutine 读到 server TypeClose 后再读)→ 稳定全收
 //
 // 跑法:
 //
@@ -120,6 +120,13 @@ func main() {
 				return nil, fmt.Errorf("send progress: %w", err)
 			}
 		}
+		// progress 流的结束必须由 server 显式发送 TypeClose 表达。
+		// 这样 client 侧的 Recv 会按队列顺序先读完所有 DATA,再在 TypeClose
+		// 上得到 io.EOF;不要让 client 本地 Close 来假装远端 EOF。
+		if err := conn.Send(&minirpc.Frame{StreamID: progressStreamID, Type: minirpc.TypeClose}); err != nil {
+			log.Printf("[server] 关闭 progress stream#%d 失败:%v", progressStreamID, err)
+			return nil, fmt.Errorf("close progress stream: %w", err)
+		}
 		// 紧接着返回主流的"完成"(handler return → 框架发 RESPONSE)。
 		// 注意:此时 progress 流的最后一条 DATA 可能还在网络/on-the-wire,
 		// 或已到 client 但还躺在 channel 没被 Recv —— 竞态窗口就在这。
@@ -211,8 +218,8 @@ func runOnce(client *minirpc.Client, mode string) int {
 
 	// ── progress 消费 goroutine ───────────────────────────────────────────
 	// 这对应真实代码里"消费 progress 的 goroutine"(containerd proxy 的 progress goroutine)。
-	var progressCount int
-	done := make(chan struct{}) // progress goroutine 排空后关闭(供 fixed 模式 join)
+	var progressCount atomic.Int32
+	done := make(chan struct{}) // progress goroutine 读到 TypeClose/EOF 后关闭(供 fixed 模式 join)
 	go func() {
 		defer close(done)
 		for {
@@ -221,7 +228,7 @@ func runOnce(client *minirpc.Client, mode string) int {
 				return // io.EOF / 流结束 → 退出
 			}
 			if f.Type == minirpc.TypeData {
-				progressCount++
+				progressCount.Add(1)
 			}
 		}
 	}()
@@ -232,7 +239,7 @@ func runOnce(client *minirpc.Client, mode string) int {
 	var result string
 	if err := client.Call("ImportService.Import", &result, "myimage", progressStreamID); err != nil {
 		log.Printf("Call Import: %v", err)
-		return progressCount
+		return int(progressCount.Load())
 	}
 
 	// ╔══════════════════════════════════════════════════════════════════╗
@@ -243,22 +250,20 @@ func runOnce(client *minirpc.Client, mode string) int {
 	// ║  最后一条 progress(done)此刻可能还躺在 progressCh 里没被 Recv 掉。 ║
 	// ╚══════════════════════════════════════════════════════════════════╝
 	if mode == "fixed" {
-		// ✅ FIXED:先 join progress goroutine,确保它把 channel 里所有 DATA
-		// 都 Recv 掉了,再读 progressCount。这就是 containerd PR #13625 的修复手法
-		// (加一个 done channel,主流程等它关闭)。
-		// 需要先 Close progress stream,让 Recv 返回 EOF,gofunc 才会退出。
-		progressStream.Close()
+		// ✅ FIXED:先 join progress goroutine,确保它读到 server 发来的
+		// TypeClose 并退出后,再读 progressCount。这就是 containerd PR #13625
+		// 的修复手法(加一个 done channel,主流程等它关闭)。
+		// goroutine 的退出来自 server 发来的 TypeClose,不是 client 本地 Close。
 		<-done
 	} else {
 		// ❌ BUGGY:不 join,直接读。这还原了"真实但漏了 join"的代码结构 ——
 		// 竞态自然发生:有时 goroutine 还没 Recv 完最后一条,我们就读了计数。
 		// 不加任何 artificial sleep,让它真实地"间歇性"漏收。
-		progressStream.Close()
 		// 这里如果加 <-done 就和 fixed 一样了;buggy 故意不加。
 		_ = done
 	}
 
-	return progressCount
+	return int(progressCount.Load())
 }
 
 // ── 辅助:client 侧自己分配 progress 流的 StreamID ──────────────────────

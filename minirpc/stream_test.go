@@ -9,18 +9,17 @@ import (
 )
 
 // stream_test.go 守护 stream.go 里最微妙的不变量:
-// Stream.Recv 在 done 被关闭后,必须先把队列里已经投递的帧全部 drain 掉,再返回 io.EOF。
+// 本地 Close 和远端 TypeClose 是两种不同语义,不能混在一起。
 //
-// 为什么这个不变量是项目级的命脉?它是 Demo 3 "fixed 模式能稳定收到全部 progress"
-// 的全部基础。如果有人简化 Recv(比如把那个 for 循环或非阻塞预读删掉),
-// Demo 3 的 fixed 模式就会偶发漏收 —— 而这正是本项目存在的全部意义(复现 + 修复
-// containerd PR #13625 的竞态)。所以这些测试必须存在,守住这个不变量。
+//   - 本地 Close 关闭 recv.done,表示调用方放弃这条流,Recv 应该尽快 EOF。
+//   - 远端 TypeClose 是排在 recv.ch 里的协议帧,Recv 应该先按 FIFO 读完前面的 DATA,
+//     再在 TypeClose 上返回 io.EOF。
 
 // newBareStream 用内部构造直接造一条 stream(不依赖真实网络),
-// 精确控制"队列里有什么"。返回 (stream, recv),recv.close() 可模拟 Stream.Close
+// 精确控制"队列里有什么"。返回 (stream, recv),recv.close() 可模拟本地 Close
 // 的"关 done"那一步(但不走 Unregister,所以不碰 conn,conn 可以为 nil)。
 //
-// 这种"绕过 conn 直接测 Recv 的 drain 逻辑"的写法,正是 unit test 应该做的:
+// 这种"绕过 conn 直接测 Recv 语义"的写法,正是 unit test 应该做的:
 // 把被测的最小单元(Stream.Recv)孤立出来,精确喂输入。
 func newBareStream(t *testing.T) (*Stream, *streamRecv) {
 	t.Helper()
@@ -48,16 +47,12 @@ func newLiveStream(t *testing.T) (*Stream, *Conn, func()) {
 	return s, conn, cleanup
 }
 
-// TestRecvDrainsPendingFramesBeforeEOF 是最关键的一条测试:
-// 队列里先有 3 帧,然后关 done(模拟 Stream.Close 的关 done 那步),
-// Recv 必须依次拿到这 3 帧,最后才返回 io.EOF。
-//
-// 如果有人把 Recv 改成"done 一关就立即返回 EOF"(删掉 drain 逻辑),
-// 这条测试会立刻失败 —— 这正是它要守护的回归。
-func TestRecvDrainsPendingFramesBeforeEOF(t *testing.T) {
+// TestRecvReturnsEOFAfterLocalCloseWithPendingFrames 守护本地 Close 语义:
+// done 被关闭表示调用方放弃这条流,即使队列里还有已投递帧,Recv 也应该 EOF。
+func TestRecvReturnsEOFAfterLocalCloseWithPendingFrames(t *testing.T) {
 	s, recv := newBareStream(t)
 
-	// 投 3 帧进队列(模拟 server 在 client Close 前刚推完的 progress)
+	// 投 3 帧进队列,再模拟本地 Close。
 	frames := []*Frame{
 		{StreamID: 42, Type: TypeData, Payload: []byte("a")},
 		{StreamID: 42, Type: TypeData, Payload: []byte("b")},
@@ -66,23 +61,11 @@ func TestRecvDrainsPendingFramesBeforeEOF(t *testing.T) {
 	for _, f := range frames {
 		recv.ch <- f
 	}
-	// 现在关 done —— 这模拟 Stream.Close()(内部走 Unregister → recv.close)。
 	recv.close()
 
-	// Recv 必须依次拿到 a, b, c,而不是任何一个被 done 抢跑后丢掉。
-	for i, want := range []string{"a", "b", "c"} {
-		got, err := s.Recv()
-		if err != nil {
-			t.Fatalf("frame %d: Recv returned %v, want frame %q (done closed but queue had pending frames — drain invariant broken)", i, err, want)
-		}
-		if string(got.Payload) != want {
-			t.Errorf("frame %d: got payload %q, want %q", i, got.Payload, want)
-		}
-	}
-	// 3 帧都 drain 完后,Recv 才该返回 EOF。
 	_, err := s.Recv()
 	if err != io.EOF {
-		t.Fatalf("after draining 3 frames: Recv returned %v, want io.EOF", err)
+		t.Fatalf("Recv after local close with pending frames: got %v, want io.EOF", err)
 	}
 }
 
@@ -155,6 +138,29 @@ func TestRecvTypeCloseFrameReturnsEOF(t *testing.T) {
 	}
 }
 
+// TestRecvDrainsDataBeforeRemoteTypeClose 守护远端 close frame 的 FIFO 语义:
+// DATA 和 TypeClose 都在 recv.ch 里,所以 TypeClose 前面的 DATA 必须先被读到。
+func TestRecvDrainsDataBeforeRemoteTypeClose(t *testing.T) {
+	s, recv := newBareStream(t)
+	recv.ch <- &Frame{StreamID: 42, Type: TypeData, Payload: []byte("a")}
+	recv.ch <- &Frame{StreamID: 42, Type: TypeData, Payload: []byte("b")}
+	recv.ch <- &Frame{StreamID: 42, Type: TypeClose, Payload: nil}
+
+	for i, want := range []string{"a", "b"} {
+		got, err := s.Recv()
+		if err != nil {
+			t.Fatalf("frame %d before TypeClose: Recv returned %v, want %q", i, err, want)
+		}
+		if string(got.Payload) != want {
+			t.Errorf("frame %d: got payload %q, want %q", i, got.Payload, want)
+		}
+	}
+	_, err := s.Recv()
+	if err != io.EOF {
+		t.Fatalf("Recv on trailing TypeClose: got %v, want io.EOF", err)
+	}
+}
+
 // TestRecvTypeErrorFrameReturnsError 守护"收到 TypeError 帧 → streamError"。
 // 同时验证 payload 里的 Response.Err 被正确提取。
 func TestRecvTypeErrorFrameReturnsError(t *testing.T) {
@@ -208,16 +214,10 @@ func TestCloseIdempotent(t *testing.T) {
 	}
 }
 
-// TestRecvDrainsAfterPublicCloseWithLiveReadLoop 是 drain 不变量的"真实路径"测试。
-//
-// 为什么这条比 TestRecvDrainsPendingFramesBeforeEOF 更重要?那条测试直接调
-// 内部 recv.close() 跳过了 Stream.Close() 的完整流程 —— 而 Stream.Close() 还会
-// 调 conn.Unregister:从 map 摘掉流 → 关 done。这中间有一个"读循环可能正把
-// 最后一帧投进 channel"的窗口,正是 Demo 3 fixed 模式依赖的不变量。
-//
-// 这条测试用真实 net.Pipe + readLoop:喂 3 帧 DATA 进 pipe → 调公共 Stream.Close()
-// → Recv 必须依次拿到 3 帧,再 EOF。覆盖了之前裸露的公共路径。
-func TestRecvDrainsAfterPublicCloseWithLiveReadLoop(t *testing.T) {
+// TestRecvStopsAfterPublicCloseWithLiveReadLoop 覆盖公共 Close 路径:
+// 即使 readLoop 已经把帧投进队列,公共 Stream.Close 也表示本地放弃接收,
+// 后续 Recv 应该直接 EOF。
+func TestRecvStopsAfterPublicCloseWithLiveReadLoop(t *testing.T) {
 	a, b := net.Pipe()
 	conn := NewConn(a) // server 端,自带 readLoop
 	defer func() {
@@ -263,25 +263,12 @@ func TestRecvDrainsAfterPublicCloseWithLiveReadLoop(t *testing.T) {
 	}
 
 	// 此刻 3 帧都在 recv.ch 里。调**公共** Stream.Close() → Unregister 关 done。
-	// drain 不变量保证:已经在 channel 里的帧必须先被 Recv 消费完,再返回 EOF。
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Stream.Close: %v", err)
 	}
 
-	// Recv 必须依次拿到 p1, p2, p3,再 io.EOF。
-	// (顺序保留,因为 channel 是 FIFO 且这些帧早在 Close 前就排好了。)
-	for i, want := range []string{"p1", "p2", "p3"} {
-		got, err := stream.Recv()
-		if err != nil {
-			t.Fatalf("frame %d after Close: Recv returned %v, want %q (drain invariant broken — frames already in channel got dropped)", i, err, want)
-		}
-		if string(got.Payload) != want {
-			t.Errorf("frame %d: got %q, want %q", i, got.Payload, want)
-		}
-	}
-	// 全 drain 完,Recv 必须返回 io.EOF。
 	_, err = stream.Recv()
 	if err != io.EOF {
-		t.Fatalf("after draining all frames, Recv: got %v, want io.EOF", err)
+		t.Fatalf("Recv after public Close with queued frames: got %v, want io.EOF", err)
 	}
 }

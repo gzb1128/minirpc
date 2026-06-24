@@ -130,6 +130,7 @@ T=0  发 [id=A]REQUEST(Import)                  ───►  开始 import
 T=.1s                                         ◄───  发 [id=B]DATA(progress 33%)
 T=.2s                                         ◄───  发 [id=B]DATA(progress 66%)
 T=.3s                                         ◄───  发 [id=B]DATA(done)
+T=.3s                                         ◄───  发 [id=B]CLOSE(EOF)
 T=.3s                                         ◄───  发 [id=A]RESPONSE(ok)  ← RPC 完成
 
      ┌── 主流程 client.Call 收到 id=A 响应,解阻塞!
@@ -140,21 +141,19 @@ T=.3s                                         ◄───  发 [id=A]RESPONSE(o
   (--mode buggy):
      主流程立刻读 progressCount → 可能是 1/2(漏了 done) ❌ 偶发
   (--mode fixed):
-     主流程等 <-done(goroutine 排空后再唤醒)→ progressCount=3 ✓ 稳定
+     主流程等 <-done(goroutine 读到 CLOSE 后再唤醒)→ progressCount=3 ✓ 稳定
 ```
 
 **两个模式的唯一代码差异**(在 `cmd/stream/main.go::runOnce` 里,用注释明确标出):
 
 ```go
 if mode == "fixed" {
-    // ✅ FIXED:先 join progress goroutine,确保它把队列里所有 DATA
-    // 都 Recv 掉了,再读 progressCount。
-    progressStream.Close()
+    // ✅ FIXED:先 join progress goroutine,确保它读到 server 发来的
+    // TypeClose 并退出后,再读 progressCount。
     <-done
 } else {
     // ❌ BUGGY:不 join,直接读。还原"真实但漏了 join"的代码结构 ——
     // 竞态自然发生:有时 goroutine 还没 Recv 完最后一条,我们就读了计数。
-    progressStream.Close()
     _ = done
 }
 ```
