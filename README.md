@@ -5,11 +5,12 @@
 
 ## 这个项目是干嘛的
 
-通过**从零写一个极简 RPC 框架 + 三个 demo**,搞懂三件事:
+通过**从零写一个极简 RPC 框架 + 四个 demo**,搞懂四件事:
 
 1. **远程函数调用** —— `client.Add(2,3)` 怎么调到另一个进程的函数
 2. **多路复用** —— 为什么一条 TCP 上能并发跑多个请求,互不阻塞
 3. **流式 RPC + 竞态** —— server 持续推送时,"RPC 返回"和"流消费完"为什么会不同步
+4. **逻辑流上持续多帧** —— 大对象(如镜像层 blob)为什么必须靠一条流上飞很多帧分块传
 
 ## 灵感来源
 
@@ -36,7 +37,8 @@ minirpc/
 └── cmd/
     ├── unary/              # Demo 1: 远程函数调用入门
     ├── multiplex/          # Demo 2: 多路复用可视化 ⭐ 核心
-    └── stream/             # Demo 3: 流式 RPC + 竞态复现 ⭐ 对应真实 bug
+    ├── stream/             # Demo 3: 流式 RPC + 竞态复现 ⭐ 对应真实 bug
+    └── upload/             # Demo 4: 分块大传输(client-streaming)⭐ 一条流上持续多帧
 ```
 
 ## 运行
@@ -54,11 +56,15 @@ go run ./cmd/multiplex
 go run ./cmd/stream --mode buggy -count 20    # 会偶发漏收 progress
 go run ./cmd/stream --mode fixed  -count 20    # 全部正确
 
+# Demo 4 —— 分块大传输(client-streaming)
+go run ./cmd/upload                            # 默认 4KB blob,切成 16 块传
+go run ./cmd/upload -total 512 -size 128       # 调小,看完整多帧时序
+
 # 跑单测(含 race detector)
 go test -race ./minirpc/
 ```
 
-## 三个 demo 看什么
+## 四个 demo 看什么
 
 ### Demo 1:`cmd/unary` —— 远程函数调用入门
 
@@ -185,6 +191,61 @@ if mode == "fixed" {
   ✅ fixed 模式下全部正确收到 3 条 progress,join 修复有效。
 ```
 
+### Demo 4:`cmd/upload` —— 分块大传输 / client-streaming ⭐ 一条流上持续多帧
+
+前三个 demo 里,每个方向最多只在一条流上发一两个帧,读者容易误以为"逻辑流 = 一个 frame"。
+但真实场景(containerd 传镜像层 blob)是:**一大块数据被切成很多块,在同一条流上逐帧推过去**,server 在 Recv 循环里逐块收。这个模型,只有 Demo 4 直观展示了。
+
+**时序图**:
+
+```
+client                                            server
+  │                                                  │
+  │ stream = client.Stream("UploadService.UploadBlob")
+  │ 发 [id=X]REQUEST(分派 method)  ──────────────►   handler 启动,第一帧只拿 method
+  │                                                  │
+  │ for 每一块 blob:                                  │
+  │   发 [id=X]DATA(chunk#1)      ──────────────►   Recv → 拼进 buffer / 累算 hash
+  │   发 [id=X]DATA(chunk#2)      ──────────────►   Recv → 拼进 buffer
+  │   ...                                            │
+  │ CloseSend() → 发 [id=X]CLOSE  ───────────────►   Recv → io.EOF,退出循环
+  │                                                  │   算 SHA256(buffer)
+  │                                                  │
+  │  ◄──────────────  发 [id=X]RESPONSE(hex hash)    │  handler return(框架发 RESPONSE)
+  │  ◄──────────────  发 [id=X]CLOSE(框架发)          │  流结束
+  │ Recv RESPONSE → 拿到 server 的 hash              │
+  │ Recv → io.EOF                                    │
+  │ 对比本地 hash == server hash ✓                    │
+```
+
+**关键观察**:全程 1 条 TCP、1 个 StreamID,上面飞了 `1 REQUEST + N DATA + 1 CLOSE + 1 RESPONSE + 1 CLOSE` 个帧。第一帧 REQUEST 只负责 method 分派;后续同 StreamID 的 DATA 由 `readLoop` 按 header 投递到同一条流,handler 在 Recv 循环里逐块消费——**这就是"一条逻辑流上持续多帧"的模型**。
+
+`CloseSend()`(PR #4 新增)是协议帧,表达"我说完了"(远端 EOF),**不是**本地 `Close()`(后者拆掉接收队列)。调完 `CloseSend` 仍能 Recv 到 server 的 RESPONSE。
+
+SHA256 对比是**顺序敏感**的:任何一块乱序或丢失,hex 立刻不符。
+
+**典型输出**:
+
+```
+=== Demo 4: 分块大传输 / client-streaming (total=512 bytes, chunkSize=128) ===
+[client] 拨号 127.0.0.1:63363 —— 全程只用这一条 TCP
+[client] blob=512 bytes,切成 4 块(每块 <= 128 bytes),本地 SHA256=95349daf…
+[client]   Send chunk#1: 128 bytes  "UploadBlob-Demo4-0000-Up…"
+[client]   Send chunk#2: 128 bytes  "005-UploadBlob-Demo4-000…"
+[client]   Send chunk#3: 128 bytes  "o4-0011-UploadBlob-Demo4…"
+[client]   Send chunk#4: 128 bytes  "-Demo4-0017-UploadBlob-D…"
+[client] CloseSend → 发了 TypeClose,server 的 Recv 循环会拿到 io.EOF 退出
+[server] 收到 stream#1 的 UploadBlob 请求,开始 Recv 循环收数据块...
+[server]   Recv chunk#1: 128 bytes  (累计 128 bytes)  "UploadBlob-Demo4-0000-Up…"
+[server]   Recv chunk#2: 128 bytes  (累计 256 bytes)  "005-UploadBlob-Demo4-000…"
+[server]   Recv chunk#3: 128 bytes  (累计 384 bytes)  "o4-0011-UploadBlob-Demo4…"
+[server]   Recv chunk#4: 128 bytes  (累计 512 bytes)  "-Demo4-0017-UploadBlob-D…"
+[server] stream#1 收完:共 4 块 / 512 bytes,算 SHA256
+[client] server SHA256 = 95349daf…
+[client] local  SHA256 = 95349daf…
+[client] ✅ hash 匹配!512 bytes 完整按序到达
+```
+
 ## 框架 API 速查
 
 ```go
@@ -208,6 +269,18 @@ for {
     f, err := stream.Recv()
     if err == io.EOF { break }
     // handle f
+}
+
+// client 端(client-streaming)—— 在同一条流上反复 Send 多帧,再 CloseSend 半关闭
+stream, _ = client.Stream("UploadService.UploadBlob")
+for _, chunk := range chunks {
+    stream.Send(minirpc.TypeData, chunk)   // 同一个 StreamID 上飞多帧
+}
+stream.CloseSend()                         // 协议帧:我说完了,但仍可 Recv 等 RESPONSE
+for {
+    f, err := stream.Recv()
+    if err == io.EOF { break }
+    // 等 RESPONSE
 }
 ```
 
@@ -237,6 +310,7 @@ Type 枚举:`1=REQUEST` / `2=RESPONSE` / `3=DATA` / `4=CLOSE(EOF)` / `5=ERROR`�
 | client.Call 阻塞等响应 | proxyTransferrer 调 `p.client.Transfer` |
 | Demo 3 的 progress goroutine | proxy 的 progress 消费 goroutine |
 | Demo 3 的竞态 + join 修复 | PR #13625 的 done channel + 等待 |
+| Demo 4 的分块 Send + CloseSend | 镜像层 blob 传输 / ttrpc client-streaming |
 
 demo 里学到的机制 = 真实生产 RPC 的机制,只是生产版多了 protobuf、tls、更完善的错误处理等"工程外壳"。
 
@@ -250,7 +324,8 @@ demo 里学到的机制 = 真实生产 RPC 的机制,只是生产版多了 proto
 | 4 | Demo 2 三请求交错完成,0.5s 先回,标注"共用 1 条 TCP" | ✅ PASS |
 | 5 | Demo 3 buggy `-count=20` 至少出现一次 `<3`;fixed `-count=20` 全部 `==3`;两模式唯一差异是 join | ✅ PASS |
 | 6 | 包结构清晰,每文件顶部有 doc comment 说明角色 | ✅ PASS |
-| 7 | 时序图在 README(Demo 2、Demo 3) | ✅ PASS(见上) |
+| 7 | 时序图在 README(Demo 2、Demo 3、Demo 4) | ✅ PASS(见上) |
+| 8 | Demo 4 跑通:打印 hash 匹配,日志展示一条流上飞多帧(REQUEST + N DATA + CLOSE + RESPONSE + CLOSE) | ✅ PASS |
 
 附:`go test -race ./minirpc/` 也全绿 —— 多路复用的并发分派经过了 race detector 验证。
 

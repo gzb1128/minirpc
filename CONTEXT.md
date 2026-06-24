@@ -96,6 +96,22 @@ minirpc/
   - 跑 `--buggy` 多次(`-count=20`)能看到偶发少收事件;`--fixed` 稳定全收
 - **教学点**:这是把抽象的"多路复用导致异步"变成可复现、可修复的代码。作者亲历过这个 bug 的排查,这里让它"落地"。
 
+#### Demo 4: `cmd/upload/` — 分块大传输 / client-streaming ⭐ 一条流上持续多帧
+- 前三个 demo 每个方向最多发一两个帧,读者容易误以为"逻辑流 = 一个 frame"。
+  Demo 4 补上这个缺口:**一条逻辑流上持续飞很多个 DATA 帧**。
+- 场景(模仿 containerd 传镜像层 blob):client 把一大段文本切成 N 块,
+  在**同一条** `StreamID` 上逐块 `Send(TypeData, …)`;server handler 在 `Recv()` 循环里
+  逐块收、边收边拼;client `CloseSend()`(半关闭发送方向)后 server 拿到 `io.EOF` 退出循环,
+  算 SHA256 通过 RESPONSE 返回;client 本地也算一份对比。
+- payload 用**文本块**(JSON 字符串),日志可读;`chunkBlob` 按**字节**切分(不保证字符边界,
+  贴近字节流 blob 的真实表现),见 `cmd/upload/main_test.go`。
+- **教学点**:
+  - `Stream` 不是"发一次就扔",是一条可以反复 `Send` / `Recv` 的通道。
+  - 第一帧 REQUEST 只做 method 分派;后续同 StreamID 的 DATA 由 `readLoop` 投递到同一条流。
+  - `CloseSend` = 协议帧(远端 EOF),`Close` = 本地拆接收队列,两者严格区分。
+  - SHA256 对比是**顺序敏感**的:乱序/丢帧立刻 hash 不符(补上 sum 交换律测不出的回归)。
+- 对应真实世界:containerd 镜像层 blob 传输 = 一条 ttrpc 流上飞大量 DATA 帧。
+
 ---
 
 ## 3. 协议规格 (Protocol Spec)
