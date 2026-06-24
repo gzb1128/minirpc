@@ -85,29 +85,38 @@ client 进程                              server 进程
 ─────────────                            ─────────────
 一条 net.Conn ───────────────────────────────────────
 
-T+0.000s  发起 req#1 (期望 1.0s)  ───►   sleep 1s
-T+0.000s  发起 req#2 (期望 2.0s)  ───►   sleep 2s
-T+0.000s  发起 req#3 (期望 0.5s)  ───►   sleep .5s
+T+0.000s  发起 task A (RPC payload: duration=1000ms) ───►   [stream#X] sleep 1s
+T+0.000s  发起 task B (RPC payload: duration=2000ms) ───►   [stream#Y] sleep 2s
+T+0.000s  发起 task C (RPC payload: duration=500ms)  ───►   [stream#Z] sleep .5s
                                            (3 个 server goroutine 并发)
-T+0.5s                              ◄───  req#3 RESPONSE   ← 先回来!不是发起顺序
-T+1.0s                              ◄───  req#1 RESPONSE
-T+2.0s                              ◄───  req#2 RESPONSE   ← 最后
+T+0.5s                              ◄───  stream#Z RESPONSE   ← 先回来!不是发起顺序
+T+1.0s                              ◄───  stream#X RESPONSE
+T+2.0s                              ◄───  stream#Y RESPONSE   ← 最后
 
 关键观察:三条响应到达顺序 = 完成顺序,不是发起顺序。
          全程只用一条 TCP。这就是多路复用。
+         task A/B/C 只是本地日志标签,不进入 RPC payload;
+         真正在 TCP 字节流里分发 frame 的是协议层 StreamID。
 ```
 
 实际日志样例:
 
 ```
 T+0.102s  client  拨号 127.0.0.1:52386 —— 全程只用这一条 TCP 连接
-T+0.104s  client  发起 req#1 (期望 1.0s)
-T+0.104s  client  发起 req#2 (期望 2.0s)
-T+0.104s  client  发起 req#3 (期望 0.5s)
-T+0.608s  client  收到 req#3 响应   ← ★ 最先完成!不是发起顺序 —— 多路复用的证据
-T+1.108s  client  收到 req#1 响应   ← 第 2 个完成(按耗时,不按发起顺序)
-T+2.108s  client  收到 req#2 响应   ← 第 3 个完成(按耗时,不按发起顺序)
+T+0.104s  client  发起 task A (RPC 只发送 duration=1000ms)
+T+0.104s  client  发起 task B (RPC 只发送 duration=2000ms)
+T+0.104s  client  发起 task C (RPC 只发送 duration=500ms)
+T+0.106s  server  收到 stream#3 的 SlowOp(duration=1000ms)
+T+0.106s  server  收到 stream#5 的 SlowOp(duration=2000ms)
+T+0.106s  server  收到 stream#1 的 SlowOp(duration=500ms)
+T+0.608s  client  收到 task C 响应   ← ★ 最先完成!不是发起顺序 —— 多路复用的证据
+T+1.108s  client  收到 task A 响应   ← 第 2 个完成(按耗时,不按发起顺序)
+T+2.108s  client  收到 task B 响应   ← 第 3 个完成(按耗时,不按发起顺序)
 ```
+
+注意:并发 goroutine 谁先真正调用 `client.Call` 不固定,所以示例里的
+`stream#1/#3/#5` 和 task A/B/C 的对应关系每次运行都可能不同。这正是要
+强调的边界:业务标签不是 StreamID;Conn 读循环只看 frame header 里的 StreamID。
 
 ### Demo 3:`cmd/stream` —— 流式 RPC + 竞态复现 ⭐ 对应真实 bug
 
