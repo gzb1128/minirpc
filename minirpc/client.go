@@ -13,8 +13,9 @@ import (
 //  1. Dial 一条 TCP,包成 Conn(自带读循环 + 分发)。
 //  2. Call(method, args...):生成唯一 StreamID → OpenStream → 发 REQUEST →
 //     阻塞 Recv 等到 RESPONSE(忽略中间的 DATA 帧)→ 解 result 返回。这是 unary 调用。
-//  3. Stream(method, args...):同上但不阻塞,返回 *Stream,调用方自己 Recv() 消费 DATA。
-//     这是 server-streaming 调用,Demo 3 用它。
+//  3. Stream(method, args...):同上但不阻塞,返回 *Stream。它是所有流式形态
+//     (server-streaming / client-streaming / bidi)的原始入口:调用方自己
+//     Send/CloseSend/Recv 决定方向。Demo 3 用它做 server-streaming。
 //
 // 关键点:client.Call 是**阻塞**的,内部就是一个"等到 RESPONSE 才返回"的循环。
 // 多个 client.Call 并发跑 → 多个 StreamID 在一条 TCP 上同时飞 → 多路复用。
@@ -115,11 +116,16 @@ func (c *Client) Call(method string, out any, args ...any) error {
 	}
 }
 
-// Stream 发起一次 server-streaming 调用:把 REQUEST 发出去,立刻返回 *Stream。
+// Stream 发起一次流式调用:把 REQUEST 发出去,立刻返回 *Stream。
+// 它是所有流式形态的"原始"入口 —— 调用方拿到 Stream 后自己决定怎么用:
 //
-// 调用方拿到 Stream 后自己循环 Recv() 消费 server 推过来的 DATA,
-// 直到 io.EOF。注意:server 发完所有 DATA 后还会发一个 RESPONSE 作为"调用完成"
-// 的信号(对应 Demo 3 的"id=A RESPONSE"),client 拿到它就知道整个 RPC 结束了。
+//   - server-streaming(server 持续推 DATA):循环 Recv() 消费到 io.EOF。Demo 3 用它。
+//   - client-streaming(client 持续推 DATA):循环 Send(TypeData, …) 推数据,
+//     推完调 CloseSend() 半关闭发送方向,再 Recv() 等 server 的 RESPONSE。
+//   - bidi(双向):Send / Recv 交错,最后 CloseSend + 等 RESPONSE。
+//
+// 注意:server 发完所有 DATA 后还会发一个 RESPONSE 作为"调用完成"的信号
+// (对应 Demo 3 的"id=A RESPONSE"),client 拿到它就知道整个 RPC 结束了。
 // 但"调用完成"≠"我已经把流里所有数据处理完",这正是 Demo 3 竞态的根源。
 func (c *Client) Stream(method string, args ...any) (*Stream, error) {
 	return c.openAndSend(method, args)

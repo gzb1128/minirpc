@@ -3,6 +3,8 @@ package minirpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -244,6 +246,87 @@ func TestServerConcurrentCalls(t *testing.T) {
 		if r.out != r.in*2 {
 			t.Errorf("call in=%d: got out=%d, want %d (results may be crossed — multiplexing bug)", r.in, r.out, r.in*2)
 		}
+	}
+}
+
+// TestServerStreamReceivesMultipleDataFrames 守护真正的逻辑流模型:
+// 第一帧 REQUEST 只负责 method 分派;同一个 StreamID 后续继续来的 DATA
+// 必须被 conn.readLoop 投递到同一条 stream,由 handler 在 stream.Recv 循环里消费。
+func TestServerStreamReceivesMultipleDataFrames(t *testing.T) {
+	addr := startServer(t, func(s *Server) {
+		s.Register("Upload.Sum", func(stream *Stream, args json.RawMessage) (any, error) {
+			var sum int
+			for {
+				f, err := stream.Recv()
+				if err == io.EOF {
+					return sum, nil
+				}
+				if err != nil {
+					return nil, err
+				}
+				if f.Type != TypeData {
+					return nil, fmt.Errorf("expected DATA frame, got %s", f.Type)
+				}
+				var n int
+				if err := Decode(f.Payload, &n); err != nil {
+					return nil, err
+				}
+				sum += n
+			}
+		})
+	})
+
+	client, err := Dial(addr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer client.Close()
+
+	stream, err := client.Stream("Upload.Sum")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	for _, n := range []int{2, 3, 5} {
+		payload, err := Encode(n)
+		if err != nil {
+			t.Fatalf("Encode(%d): %v", n, err)
+		}
+		if err := stream.Send(TypeData, payload); err != nil {
+			t.Fatalf("send DATA %d: %v", n, err)
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+
+	var got int
+	for {
+		f, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("stream closed before response: %v", err)
+		}
+		if f.Type != TypeResponse {
+			continue
+		}
+		var resp Response
+		if err := Decode(f.Payload, &resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if resp.Err != "" {
+			t.Fatalf("server returned error: %s", resp.Err)
+		}
+		if err := Decode(resp.Result, &got); err != nil {
+			t.Fatalf("decode result: %v", err)
+		}
+		break
+	}
+	if got != 10 {
+		t.Fatalf("got sum %d, want 10", got)
+	}
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("after response got err %v, want io.EOF", err)
 	}
 }
 

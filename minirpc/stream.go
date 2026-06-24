@@ -12,8 +12,10 @@ import (
 // 每条流用一个 StreamID 标识。Stream 就是其中一条逻辑流的高层 API:
 //
 //   - Send(type, payload):往外发一帧(标上自己的 StreamID)。
-//   - Recv():阻塞读入站的一帧;收到 TypeClose 时返回 io.EOF(流结束的标志)。
-//   - Close():结束这条流,释放底层资源。
+//   - CloseSend():发一个 TypeClose,表示"我的发送方向到此为止"——协议帧,
+//     不影响本地接收(这是 client-streaming / bidi 的半关闭)。
+//   - Recv():阻塞读入站的一帧;收到对端的 TypeClose 时返回 io.EOF(远端说完了)。
+//   - Close():本地结束这条流、注销接收队列(我不再听了),释放底层资源。
 //
 // 为什么把 Recv 设计成"收到 CLOSE 返回 io.EOF"?
 // 因为这正是 Go 标准库 io.Reader 的习惯 —— 调用方写 for 循环一直 Recv,
@@ -23,8 +25,9 @@ type Stream struct {
 	conn *Conn
 	recv *streamRecv // 入站队列 + done(conn.go 注释里有为什么包一层)
 
-	mu     sync.Mutex
-	closed bool
+	mu         sync.Mutex
+	closed     bool // 本地 Close 已调
+	sendClosed bool // CloseSend 已调(发过远端半关闭帧)
 }
 
 // newStream 不对外暴露构造,统一通过 client/server 创建,保证 id 和 conn 配对。
@@ -63,6 +66,32 @@ func (s *Stream) Send(t FrameType, payload []byte) error {
 	})
 }
 
+// CloseSend 表示"我这条流的发送方向到此为止":发一个 TypeClose 帧给对端。
+// 幂等:多次调用只发一次帧(对应 HTTP/2 END_STREAM 只发一次的约定)。
+//
+// 注意它和 Close 完全是两件事,别混:
+//
+//   - CloseSend:协议帧。告诉对端"这条流的入站方向 EOF 了",对端 Recv 把排在
+//     它前面的 DATA 全部读完后,会在这帧上返回 io.EOF。本地的接收队列**不受
+//     影响** —— 调完 CloseSend 仍可以继续 Recv(比如等 server 的 RESPONSE)。
+//   - Close:本地动作。注销本流的接收队列(recv.done),表示"我不再读了"。
+//     它不发任何协议帧。
+//
+// 为什么要分这两个?这对应 HTTP/2 / ttrpc 的"半关闭":client-streaming /
+// bidi 场景里,client 要先把一串 DATA 推完、告诉 server"我说完了",但还想
+// 继续读 server 的回包。CloseSend 就是那个"我说完了"的信号;本地 Close 要等
+// 真的不需要这条流了才调(它会把整条流拆掉)。
+func (s *Stream) CloseSend() error {
+	s.mu.Lock()
+	if s.sendClosed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.sendClosed = true
+	s.mu.Unlock()
+	return s.Send(TypeClose, nil)
+}
+
 // Recv 阻塞读这条流的下一帧。
 //
 // 返回值:
@@ -83,11 +112,13 @@ func (s *Stream) Send(t FrameType, payload []byte) error {
 // ── 实现细节(踩过坑,很重要)─────────────────────────────────────────
 // 这里有两个不同的"结束"语义,不能混在一起:
 //
-//   - 对端正常结束流:它会发 TypeClose 帧。TypeClose 和前面的 DATA 同在
-//     recv.ch 里排队,所以 Recv 会自然按 FIFO 先读完 DATA,再在 TypeClose
-//     上返回 io.EOF。
-//   - 本地调用 Close():它会关闭 recv.done,表示调用方已经放弃这条流。
-//     此时 Recv 应该尊重本地关闭,尽快返回 io.EOF,不要再 drain 队列。
+//   - 对端结束它的发送方向:它发一个 TypeClose 帧(对端用 CloseSend 发,
+//     或框架在 RESPONSE 之后统一发)。TypeClose 和前面的 DATA 同在 recv.ch
+//     里排队,所以 Recv 会自然按 FIFO 先读完 DATA,再在 TypeClose 上返回
+//     io.EOF —— 这是"远端 EOF"。
+//   - 本地调用 Close():它会关闭 recv.done,表示调用方已经放弃这条流、不再
+//     想读。此时 Recv 应该尊重本地关闭,尽快返回 io.EOF,不要再 drain 队列
+//     —— 这是"本地取消"。
 //
 // 另一个细节:当整个 Conn 关闭时,closeAll 会 close(recv.ch),此时
 // `f, ok := <-ch` 的 ok 变成 false,handleFrame 会返回 io.EOF。
